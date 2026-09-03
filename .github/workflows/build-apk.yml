@@ -1,0 +1,90 @@
+# File: .github/workflows/build-apk.yml
+name: Build APK
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v3
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build with Gradle
+        run: ./gradlew :app:assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v3
+        with:
+          name: Salvia-Browxer-Debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 30
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v3
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build Release APK
+        run: ./gradlew :app:assembleRelease
+
+      - name: Upload Release APK
+        uses: actions/upload-artifact@v3
+        with:
+          name: Salvia-Browxer-Release
+          path: app/build/outputs/apk/release/app-release.apk
+          retention-days: 90
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: app/build/outputs/apk/release/app-release.apk
+          name: Salvia-Browxer v${{ github.run_number }}
+          tag_name: v${{ github.run_number }}
+          body: |
+            ## Salvia-Browxer Release
+            
+            ### Features
+            - Ultra-fast browser-based video downloader
+            - Hardware-accelerated WebView
+            - Built-in AdBlocker with DataStore toggle
+            - Multi-threaded download engine
+            - DASH/HLS streaming support
+            - Secure vault with AES-256 encryption
+            
+            ### Performance
+            - Zero main-thread blocking
+            - High-throughput I/O with memory-mapped files
+            - OkHttp connection pooling
+            - 60/120Hz display support
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,54 @@
+# EasyList format for AdBlocker
+# This is a subset of EasyList for performance
+
+# Ad networks
+adservice.google.com
+adservice.google.co.uk
+adservice.google.de
+adservice.google.fr
+ad.doubleclick.net
+www.googleadservices.com
+pagead2.googlesyndication.com
+tpc.googlesyndication.com
+
+# Tracking
+google-analytics.com
+www.google-analytics.com
+analytics.google.com
+ssl.google-analytics.com
+
+# Ad platforms
+adsystem.com
+adserver.com
+adtech.com
+advertising.com
+
+# CDN ad networks
+cdn.ads.com
+ads.cdn.com
+
+# Video ad networks
+videoads.com
+ads.video.com
+prebid.org
+
+# Social media tracking
+facebook.com/ads
+fbcdn.net/ads
+twitter.com/ads
+
+# Pop-up and redirect networks
+popads.net
+popunder.com
+redirect.com
+trafficjunky.net
+exoclick.com
+
+# Auto-redirect banners
+banner.com
+banners.com
+
+# Video pre-roll networks
+preroll.com
+video-preroll.com
+ads.videojs.com

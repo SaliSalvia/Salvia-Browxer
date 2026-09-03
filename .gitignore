@@ -1,0 +1,50 @@
+# File: .gitignore
+# Android
+*.iml
+.idea/
+gradle/
+build/
+local.properties
+*.hprof
+*.swp
+.DS_Store
+
+# Kotlin
+*.kt.orig
+*.kt~ 
+
+# WebView
+WebViewDebug/
+
+# FFmpeg
+ffmpeg/
+
+# Keystore
+*.jks
+*.keystore
+
+# Environment
+.env
+.env.local
+
+# Logs
+*.log
+
+# Cache
+.cache/
+
+# Test
+*_test/
+
+# Generated files
+generated/
+
+# APK
+*.apk
+*.ap_
+
+# AAR
+*.aar
+
+# Bundle
+*.aab
