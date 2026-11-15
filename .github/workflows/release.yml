@@ -1,0 +1,207 @@
+name: Release
+
+# Publishes a signed Release APK (and AAB) as a GitHub Release & workflow artifact.
+# Triggers:
+#   - push of a v* tag
+#   - push to main touching RELEASE
+#   - manual run via workflow_dispatch in the GitHub Actions tab
+
+on:
+  push:
+    tags:
+      - 'v*'
+    branches:
+      - main
+    paths:
+      - 'RELEASE'
+  workflow_dispatch:
+    inputs:
+      create_github_release:
+        description: 'Create GitHub Release & upload signed APK/AAB'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    name: Build signed APK/AAB and create Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Determine version tag
+        run: |
+          VERSION_NAME=$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle.kts | head -1)
+          if [ -z "$VERSION_NAME" ]; then
+            echo "::error::Could not parse versionName from app/build.gradle.kts"
+            exit 1
+          fi
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="v${VERSION_NAME}"
+          fi
+          echo "TAG=${TAG}" >> "$GITHUB_ENV"
+          echo "VERSION_NAME=${VERSION_NAME}" >> "$GITHUB_ENV"
+          echo "Target release tag: ${TAG}"
+
+      - name: Validate all 4 Termux signing secrets
+        env:
+          SIGNING_KEYSTORE_BASE64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
+          SIGNING_KEYSTORE_PASSWORD: ${{ secrets.SIGNING_KEYSTORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          missing=0
+          for v in SIGNING_KEYSTORE_BASE64 SIGNING_KEYSTORE_PASSWORD SIGNING_KEY_ALIAS SIGNING_KEY_PASSWORD; do
+            if [ -z "${!v}" ]; then
+              echo "::error::Secret $v is missing. Add all 4 signing secrets under Settings -> Secrets and variables -> Actions."
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+          echo "All 4 signing secrets are configured."
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Decode and verify Termux keystore before building
+        env:
+          SIGNING_KEYSTORE_BASE64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
+          SIGNING_KEYSTORE_PASSWORD: ${{ secrets.SIGNING_KEYSTORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          python3 - <<'PY'
+          import base64, os, re
+          from pathlib import Path
+          raw = os.environ["SIGNING_KEYSTORE_BASE64"].strip()
+          raw = re.sub(r"^data:[^;]+;base64,", "", raw, flags=re.I)
+          raw = re.sub(r"\s+", "", raw)
+          raw = raw.replace("-", "+").replace("_", "/")
+          pad = len(raw) % 4
+          if pad == 2:
+              raw += "=="
+          elif pad == 3:
+              raw += "="
+          data = base64.b64decode(raw, validate=False)
+          if len(data) < 32:
+              raise SystemExit("Decoded keystore is too small — check SIGNING_KEYSTORE_BASE64.")
+          out = Path(os.environ["RUNNER_TEMP"]) / "release-keystore.jks"
+          out.write_bytes(data)
+          print(f"Decoded keystore bytes: {len(data)}")
+          PY
+          KS="$RUNNER_TEMP/release-keystore.jks"
+          echo "SIGNING_KEYSTORE_FILE=$KS" >> "$GITHUB_ENV"
+          if ! keytool -list -keystore "$KS" -storepass "$SIGNING_KEYSTORE_PASSWORD" -alias "$SIGNING_KEY_ALIAS" >/dev/null 2>&1; then
+            echo "::error::Keystore verification failed! Check SIGNING_KEYSTORE_BASE64, SIGNING_KEYSTORE_PASSWORD, and SIGNING_KEY_ALIAS."
+            keytool -list -keystore "$KS" -storepass "$SIGNING_KEYSTORE_PASSWORD" 2>&1 | grep -iE "Alias|Keystore type|error" || true
+            exit 1
+          fi
+          echo "Keystore and alias '$SIGNING_KEY_ALIAS' verified successfully."
+
+      - name: Check existing release and tag
+        if: ${{ !startsWith(github.ref, 'refs/tags/') && (github.event_name != 'workflow_dispatch' || inputs.create_github_release) }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release $TAG already exists. Bump versionName and versionCode in app/build.gradle.kts before publishing a new release."
+            exit 1
+          fi
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::Tag $TAG already exists. Bump versionName and versionCode in app/build.gradle.kts before publishing a new release."
+            exit 1
+          fi
+          echo "Tag $TAG is available."
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Test, lint, and build web UI bundle into Android assets
+        run: |
+          if [ -f package-lock.json ]; then npm ci; else npm install --no-audit --no-fund; fi
+          npx tsx --test src/core/browserCore.test.ts src/core/linkPatternEngine.test.ts
+          npm run lint
+          npm run build
+          rm -rf app/src/main/assets/www
+          mkdir -p app/src/main/assets/www
+          cp -r dist/* app/src/main/assets/www/
+          rm -f app/src/main/assets/www/assets/aistudio/*.zip
+          test -f app/src/main/assets/www/index.html || { echo "assets/www/index.html missing"; exit 1; }
+
+      - name: Set up Gradle and restore dependency cache
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-provider: basic
+
+      - name: Install Android SDK 36
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "platforms;android-36" "build-tools;36.0.0" "platform-tools"
+
+      - name: Build signed release APK and AAB
+        env:
+          SIGNING_KEYSTORE_BASE64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
+          SIGNING_KEYSTORE_PASSWORD: ${{ secrets.SIGNING_KEYSTORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          set -o pipefail
+          chmod +x gradlew
+          ./gradlew :app:assembleRelease :app:bundleRelease --stacktrace --no-daemon
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -1)
+          AAB=$(ls app/build/outputs/bundle/release/*.aab | head -1)
+          test -f "$APK" || { echo "::error::Release APK missing"; exit 1; }
+          test -f "$AAB" || { echo "::error::Release AAB missing"; exit 1; }
+          echo "APK_PATH=$APK" >> "$GITHUB_ENV"
+          echo "AAB_PATH=$AAB" >> "$GITHUB_ENV"
+
+      - name: Verify APK signature with apksigner
+        run: |
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs "$APK_PATH"
+
+      - name: Upload signed release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: salviabrowxer-release-${{ env.TAG }}
+          path: |
+            ${{ env.APK_PATH }}
+            ${{ env.AAB_PATH }}
+          retention-days: 30
+
+      - name: Tag exact commit and create GitHub Release
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.create_github_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "${{ github.ref }}" != refs/tags/* ]]; then
+            git config user.name "${GITHUB_ACTOR}"
+            git config user.email "${GITHUB_ACTOR}@users.noreply.github.com"
+            git tag -a "${TAG}" -m "SalviaBrowxer ${TAG}"
+            git push origin "${TAG}"
+          fi
+          if out=$(gh release create "${TAG}" "${APK_PATH}" "${AAB_PATH}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "SalviaBrowxer ${TAG}" \
+            --generate-notes \
+            --latest 2>&1); then
+            echo "Published ${TAG}"
+            echo "$out"
+          else
+            echo "::error::gh release create failed: $out"
+            exit 1
+          fi

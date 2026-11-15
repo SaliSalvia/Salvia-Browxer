@@ -1,0 +1,6 @@
+{
+  "name": "SalviaBrowxer",
+  "description": "Private mobile browser with pattern-based multi-site media detection, multi-connection downloader, and automated Android release signing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
