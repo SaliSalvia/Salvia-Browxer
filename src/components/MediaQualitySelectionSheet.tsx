@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { Check, CircleDot, Download, Film, Square, X } from 'lucide-react';
-import { formatDurationSeconds, formatFileSize, sanitizeFilename } from '../core/mediaResolver';
+import { formatBitrateKbps, formatDurationSeconds, formatFileSize, sanitizeFilename } from '../core/mediaResolver';
 import { useApp } from '../store/AppContext';
 import type { MediaFormat } from '../types/models';
 
@@ -60,7 +60,7 @@ export const MediaQualitySelectionSheet: React.FC = () => {
       f.isHls ? 'HLS' : f.isDash ? 'DASH' : null,
       f.extension.toUpperCase(),
       f.width && f.height ? `${f.width}×${f.height}` : null,
-      f.bitrate ? `${Math.round(f.bitrate / 1000)} kbps` : null,
+      formatBitrateKbps(f.bitrate),
       f.size && f.size > 0 ? formatFileSize(f.size) : t('error_size_unavailable'),
     ].filter((item): item is string => Boolean(item));
     return parts.join(' · ');

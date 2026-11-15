@@ -5,14 +5,18 @@ import android.net.Uri
 import android.webkit.CookieManager
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
+import okhttp3.ConnectionPool
 import okhttp3.Cookie
 import okhttp3.CookieJar
+import okhttp3.Dispatcher
 import okhttp3.HttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.ResponseBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FilterInputStream
 import java.io.InputStream
@@ -20,15 +24,22 @@ import java.io.RandomAccessFile
 import java.net.InetAddress
 import java.net.URI
 import java.util.Locale
+import java.util.concurrent.Callable
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
 import kotlin.math.PI
 import kotlin.math.roundToInt
 
 object NativeProxyClient {
+    private const val MAX_TEXT_BODY_BYTES = 3 * 1024 * 1024
     private const val MOBILE_UA =
         "Mozilla/5.0 (Linux; Android 15; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
     private const val DESKTOP_UA =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
+    private val probePool: ExecutorService = Executors.newFixedThreadPool(8)
 
     private data class ExtractedCandidate(
         val url: String,
@@ -82,13 +93,34 @@ object NativeProxyClient {
     }
 
     val httpClient: OkHttpClient by lazy {
+        val dispatcher = Dispatcher().apply {
+            maxRequests = 64
+            maxRequestsPerHost = 16
+        }
         OkHttpClient.Builder()
+            .dispatcher(dispatcher)
+            .connectionPool(ConnectionPool(16, 5, TimeUnit.MINUTES))
             .cookieJar(webViewCookieJar)
             .followRedirects(true)
             .followSslRedirects(true)
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(25, TimeUnit.SECONDS)
             .build()
+    }
+
+    private fun readBoundedText(body: ResponseBody?, maxBytes: Int = MAX_TEXT_BODY_BYTES): String {
+        if (body == null) return ""
+        val input = body.byteStream()
+        val out = ByteArrayOutputStream()
+        val buf = ByteArray(16 * 1024)
+        var remaining = maxBytes
+        while (remaining > 0) {
+            val read = input.read(buf, 0, minOf(buf.size, remaining))
+            if (read <= 0) break
+            out.write(buf, 0, read)
+            remaining -= read
+        }
+        return String(out.toByteArray(), Charsets.UTF_8)
     }
 
     fun handleApiRequest(context: Context, request: WebResourceRequest): WebResourceResponse? {
@@ -148,7 +180,7 @@ object NativeProxyClient {
                     contentType.contains("application/xhtml+xml") ||
                     contentType.isEmpty()
                 ) {
-                    val rawHtml = res.body?.string().orEmpty()
+                    val rawHtml = readBoundedText(res.body)
                     val injected = BrowserBridgeInjector.inject(rawHtml, finalUrl, adBlock)
                     val title = injected.title ?: URI(finalUrl).host ?: target
                     jsonResponse(
@@ -362,14 +394,14 @@ object NativeProxyClient {
                     )
                 }
 
-                val html = res.body?.string().orEmpty()
+                val html = readBoundedText(res.body)
                 val title = parseTitleFromHtml(html, finalUrl)
                 val thumbnail = parseThumbFromHtml(html, finalUrl)
 
                 val found = LinkedHashMap<String, ExtractedCandidate>()
                 collectUrlsFromHtml(html, finalUrl, found)
 
-                // Inspect up to 3 embedded iframes one hop deep
+                // Inspect up to 3 embedded iframes concurrently one hop deep
                 val iframeRegex = Regex("<iframe\\b[^>]+\\b(?:src|data-src)=[\"']([^\"']+)[\"']", RegexOption.IGNORE_CASE)
                 val iframeUrls = iframeRegex.findAll(html)
                     .mapNotNull { m ->
@@ -383,20 +415,35 @@ object NativeProxyClient {
                     .take(3)
                     .toList()
 
-                for (iframeUrl in iframeUrls) {
-                    try {
-                        httpClient.newCall(
-                            Request.Builder()
-                                .url(iframeUrl)
-                                .header("User-Agent", MOBILE_UA)
-                                .header("Referer", finalUrl)
-                                .build()
-                        ).execute().use { iRes ->
-                            if (iRes.isSuccessful) {
-                                collectUrlsFromHtml(iRes.body?.string().orEmpty(), iRes.request.url.toString(), found)
+                if (iframeUrls.isNotEmpty()) {
+                    val futures = iframeUrls.map { iframeUrl ->
+                        probePool.submit(Callable<Pair<String, String>?> {
+                            try {
+                                httpClient.newCall(
+                                    Request.Builder()
+                                        .url(iframeUrl)
+                                        .header("User-Agent", MOBILE_UA)
+                                        .header("Referer", finalUrl)
+                                        .build()
+                                ).execute().use { iRes ->
+                                    if (iRes.isSuccessful) {
+                                        iRes.request.url.toString() to readBoundedText(iRes.body)
+                                    } else null
+                                }
+                            } catch (_: Exception) {
+                                null
                             }
+                        })
+                    }
+                    for (future in futures) {
+                        val iframePair = try {
+                            future.get(7, TimeUnit.SECONDS)
+                        } catch (_: Exception) {
+                            null
                         }
-                    } catch (_: Exception) {
+                        if (iframePair != null && iframePair.second.isNotBlank()) {
+                            collectUrlsFromHtml(iframePair.second, iframePair.first, found)
+                        }
                     }
                 }
 
@@ -436,9 +483,25 @@ object NativeProxyClient {
         }
 
         val id = tweetId?.takeIf { it.isNotBlank() } ?: return null
+        val token = syndicationTokenForTweetId(id)
+
+        // Probe FxTwitter, VxTwitter, and official Syndication concurrently
+        val fxFuture: Future<JSONObject?> = probePool.submit(Callable {
+            fetchJson("https://api.fxtwitter.com/status/$id", mapOf("User-Agent" to "SalviaBrowxer/1.0", "Accept" to "application/json"))
+        })
+        val vxFuture: Future<JSONObject?> = probePool.submit(Callable {
+            fetchJson("https://api.vxtwitter.com/Twitter/status/$id", mapOf("User-Agent" to "SalviaBrowxer/1.0", "Accept" to "application/json"))
+        })
+        val synFuture: Future<JSONObject?> = probePool.submit(Callable {
+            fetchJson(
+                "https://cdn.syndication.twimg.com/tweet-result?id=$id&lang=en&token=$token",
+                mapOf("User-Agent" to DESKTOP_UA, "Accept" to "application/json")
+            )
+        })
 
         // Strategy 1: FxTwitter JSON API (returns all MP4 bitrates + HLS + thumbnail)
-        fetchJson("https://api.fxtwitter.com/status/$id", mapOf("User-Agent" to "SalviaBrowxer/1.0", "Accept" to "application/json"))?.let { fx ->
+        val fxResult = try { fxFuture.get(9, TimeUnit.SECONDS) } catch (_: Exception) { null }
+        fxResult?.let { fx ->
             val tweet = fx.optJSONObject("tweet")
             val videos = tweet?.optJSONObject("media")?.optJSONArray("videos")
             if (videos != null && videos.length() > 0) {
@@ -536,7 +599,8 @@ object NativeProxyClient {
         }
 
         // Strategy 2: VxTwitter API
-        fetchJson("https://api.vxtwitter.com/Twitter/status/$id", mapOf("User-Agent" to "SalviaBrowxer/1.0", "Accept" to "application/json"))?.let { vx ->
+        val vxResult = try { vxFuture.get(9, TimeUnit.SECONDS) } catch (_: Exception) { null }
+        vxResult?.let { vx ->
             val mediaExt = vx.optJSONArray("media_extended")
             if (mediaExt != null && mediaExt.length() > 0) {
                 val items = ArrayList<ExtractedCandidate>()
@@ -582,11 +646,8 @@ object NativeProxyClient {
         }
 
         // Strategy 3: Official Twitter public syndication endpoint
-        val token = syndicationTokenForTweetId(id)
-        fetchJson(
-            "https://cdn.syndication.twimg.com/tweet-result?id=$id&lang=en&token=$token",
-            mapOf("User-Agent" to DESKTOP_UA, "Accept" to "application/json")
-        )?.let { syn ->
+        val synResult = try { synFuture.get(9, TimeUnit.SECONDS) } catch (_: Exception) { null }
+        synResult?.let { syn ->
             val collected = ArrayList<ExtractedCandidate>()
             val seen = HashSet<String>()
             val videoObj = syn.optJSONObject("video")
@@ -678,18 +739,28 @@ object NativeProxyClient {
             candidateUrls.add("https://d.ddinstagram.com/$kind/$shortcode")
         }
 
-        for (probeUrl in candidateUrls) {
-            val ua = if (probeUrl.contains("ddinstagram")) "TelegramBot (like TwitterBot)" else MOBILE_UA
-            val res = fetchText(
-                probeUrl,
-                mapOf(
-                    "User-Agent" to ua,
-                    "Accept" to "text/html,application/json,application/xhtml+xml;q=0.9,*/*;q=0.8",
-                    "Accept-Language" to "en-US,en;q=0.9",
-                    "Sec-Fetch-Site" to "none",
-                    "Sec-Fetch-Mode" to "navigate"
+        val futures = candidateUrls.map { probeUrl ->
+            probePool.submit(Callable<Pair<String, String>?> {
+                val ua = if (probeUrl.contains("ddinstagram")) "TelegramBot (like TwitterBot)" else MOBILE_UA
+                fetchText(
+                    probeUrl,
+                    mapOf(
+                        "User-Agent" to ua,
+                        "Accept" to "text/html,application/json,application/xhtml+xml;q=0.9,*/*;q=0.8",
+                        "Accept-Language" to "en-US,en;q=0.9",
+                        "Sec-Fetch-Site" to "none",
+                        "Sec-Fetch-Mode" to "navigate"
+                    )
                 )
-            ) ?: continue
+            })
+        }
+
+        for (future in futures) {
+            val res = try {
+                future.get(9, TimeUnit.SECONDS)
+            } catch (_: Exception) {
+                null
+            } ?: continue
             val (finalUrl, body) = res
             if (body.isBlank()) continue
 
@@ -699,17 +770,17 @@ object NativeProxyClient {
                 if (thumbnail == null) thumbnail = parseThumbFromHtml(body, finalUrl)
             }
             collectUrlsFromHtml(body, finalUrl, found)
+        }
 
-            if (found.isNotEmpty()) {
-                val sorted = found.values.sortedByDescending { it.height ?: 0 }
-                val arr = JSONArray().apply { sorted.forEach { put(it.toJson()) } }
-                return JSONObject()
-                    .put("ok", true)
-                    .put("finalUrl", pattern.canonicalUrl)
-                    .put("title", title)
-                    .put("thumbnail", thumbnail ?: JSONObject.NULL)
-                    .put("items", arr)
-            }
+        if (found.isNotEmpty()) {
+            val sorted = found.values.sortedByDescending { it.height ?: 0 }
+            val arr = JSONArray().apply { sorted.forEach { put(it.toJson()) } }
+            return JSONObject()
+                .put("ok", true)
+                .put("finalUrl", pattern.canonicalUrl)
+                .put("title", title)
+                .put("thumbnail", thumbnail ?: JSONObject.NULL)
+                .put("items", arr)
         }
         return null
     }
@@ -1020,7 +1091,7 @@ object NativeProxyClient {
             httpClient.newCall(builder.build()).execute().use { res ->
                 if (!res.isSuccessful) return null
                 val finalUrl = res.request.url.toString()
-                val body = res.body?.string().orEmpty()
+                val body = readBoundedText(res.body)
                 finalUrl to body
             }
         } catch (_: Exception) {
@@ -1045,10 +1116,19 @@ object NativeProxyClient {
             .replace("\\u0025", "%", ignoreCase = true)
             .replace("\\u003C", "<", ignoreCase = true)
             .replace("\\u003E", ">", ignoreCase = true)
+            .replace("\\x2F", "/", ignoreCase = true)
+            .replace("\\x3A", ":", ignoreCase = true)
+            .replace("\\x26", "&", ignoreCase = true)
+            .replace("\\x3D", "=", ignoreCase = true)
+            .replace("\\x3F", "?", ignoreCase = true)
             .replace("\\/", "/")
             .replace("&#x2F;", "/", ignoreCase = true)
             .replace("&#38;", "&")
             .replace("&amp;", "&", ignoreCase = true)
+            .replace("&quot;", "\"", ignoreCase = true)
+            .replace("&#039;", "'")
+            .replace("&#39;", "'")
+            .replace("&#x27;", "'", ignoreCase = true)
     }
 
     private fun parseTitleFromHtml(html: String, finalUrl: String): String {
@@ -1106,7 +1186,7 @@ object NativeProxyClient {
         }
 
         val keyRegex = Regex(
-            "\"(?:contentUrl|playbackUrl|playable_url(?:_quality_hd)?|browser_native_hd_url|browser_native_sd_url|hd_src(?:_no_ratelimit)?|sd_src(?:_no_ratelimit)?|video_url|playAddr|downloadAddr|fallback_url|hls_url|hls_manifest_url|dash_url|mp4_url|file|src)\"\\s*:\\s*\"(https?://[^\"]+)\"",
+            "\"(?:contentUrl|playbackUrl|playable_url(?:_quality_hd)?|browser_native_hd_url|browser_native_sd_url|hd_src(?:_no_ratelimit)?|sd_src(?:_no_ratelimit)?|video_url|video_hls_url|playAddr|downloadAddr|fallback_url|hls_url|hls_manifest_url|dash_url|dashManifestUrl|playlistUrl|manifestUrl|streamUrl|mediaUrl|hdUrl|sdUrl|mp4_url|file|src)\"\\s*:\\s*\"(https?://[^\"]+)\"",
             RegexOption.IGNORE_CASE
         )
         for (match in keyRegex.findAll(unescaped)) {

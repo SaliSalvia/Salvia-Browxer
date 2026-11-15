@@ -120,6 +120,7 @@ export interface PlayerTarget {
   url: string;
   title: string;
   downloadId?: string;
+  isHls?: boolean;
 }
 
 interface AppContextValue {
@@ -335,9 +336,40 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         : d
     )
   );
+  const downloadsRef = useRef(downloads);
+  downloadsRef.current = downloads;
+  const lastDownloadsSaveRef = useRef(0);
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.downloads, JSON.stringify(downloads));
+    const hasActiveProgress = downloads.some(
+      (d) => d.status === 'DOWNLOADING' || d.status === 'PREPARING' || d.status === 'RESOLVING'
+    );
+    const now = Date.now();
+    if (!hasActiveProgress || now - lastDownloadsSaveRef.current >= 900) {
+      lastDownloadsSaveRef.current = now;
+      localStorage.setItem(STORAGE_KEYS.downloads, JSON.stringify(downloads));
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      lastDownloadsSaveRef.current = Date.now();
+      localStorage.setItem(STORAGE_KEYS.downloads, JSON.stringify(downloadsRef.current));
+    }, 900);
+    return () => window.clearTimeout(timer);
   }, [downloads]);
+
+  useEffect(() => {
+    const flushDownloads = () => {
+      try {
+        localStorage.setItem(STORAGE_KEYS.downloads, JSON.stringify(downloadsRef.current));
+      } catch {
+        // ignore quota errors
+      }
+    };
+    window.addEventListener('beforeunload', flushDownloads);
+    return () => {
+      window.removeEventListener('beforeunload', flushDownloads);
+      flushDownloads();
+    };
+  }, []);
 
   const [tabs, setTabs] = useState<Tab[]>(() => {
     const saved = loadJson<Tab[]>(STORAGE_KEYS.tabs, []);
@@ -376,6 +408,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     () => tabs.find((item) => item.id === currentTabId) ?? tabs[0],
     [tabs, currentTabId]
   );
+  const tabsRef = useRef<Tab[]>(tabs);
+  tabsRef.current = tabs;
+  const tabAbortRef = useRef<Map<string, AbortController>>(new Map());
 
   const [tabPages, setTabPages] = useState<Record<string, TabPageRenderState>>({});
   const [tabMedia, setTabMedia] = useState<Record<string, MediaCandidate[]>>({});
@@ -475,6 +510,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
       setBlockedCleartextUrl(null);
 
+      // Cancel any in-flight navigation for this tab so stale fetches never overwrite newer state
+      tabAbortRef.current.get(tabId)?.abort();
+      const ctrl = new AbortController();
+      tabAbortRef.current.set(tabId, ctrl);
+
+      const isPrivateTab = Boolean(tabsRef.current.find((tItem) => tItem.id === tabId)?.isPrivate);
+
       // Update tab metadata and reset media candidates for this new page
       setTabMedia((prev) => ({ ...prev, [tabId]: [] }));
       setTabVisibleMedia((prev) => ({ ...prev, [tabId]: null }));
@@ -498,6 +540,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       // Built-in showcase page
       const showcase = BUILTIN_SHOWCASE_PAGES.find((p) => p.url === url);
       if (showcase) {
+        tabAbortRef.current.delete(tabId);
         setTabPages((prev) => ({
           ...prev,
           [tabId]: {
@@ -526,7 +569,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         }));
         setTabMedia((prev) => ({ ...prev, [tabId]: candidates }));
         setTabVisibleMedia((prev) => ({ ...prev, [tabId]: candidates[0]?.mediaUrl ?? null }));
-        if (!tabs.find((tItem) => tItem.id === tabId)?.isPrivate) {
+        if (!isPrivateTab) {
           setHistory((prev) => [
             { id: makeId('hist'), title: showcase.title, url, visitedAt: Date.now() },
             ...prev.filter((h) => h.url !== url).slice(0, 199),
@@ -548,12 +591,23 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         },
       }));
 
+      // Kick off platform pattern extraction concurrently with page load so X/Instagram/etc. highlight fast
+      const isPlatformPage = !isYouTubeExcludedUrl(url) && analyzePastedLink(url)?.category === 'PLATFORM_PAGE';
+      if (isPlatformPage) {
+        void extractMediaFromPageUrl(url).then((extracted) => {
+          if (!ctrl.signal.aborted && extracted.ok && extracted.candidates.length > 0) {
+            mergeTabCandidates(tabId, extracted.candidates);
+          }
+        });
+      }
+
       const host = hostOfUrl(url) || '';
       const adBlockActive = settings.isAdBlockEnabled && !settings.adBlockDisabledSites.includes(host);
 
       try {
         const res = await fetch(
-          apiUrl(`/api/browse?url=${encodeURIComponent(url)}&desktop=${settings.isDesktopSite ? '1' : '0'}&adblock=${adBlockActive ? '1' : '0'}`)
+          apiUrl(`/api/browse?url=${encodeURIComponent(url)}&desktop=${settings.isDesktopSite ? '1' : '0'}&adblock=${adBlockActive ? '1' : '0'}`),
+          { signal: ctrl.signal }
         );
         const data = (await res.json()) as {
           ok?: boolean;
@@ -568,6 +622,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           contentLength?: number | null;
           error?: string;
         };
+
+        if (ctrl.signal.aborted) return;
 
         if (!data.ok) {
           const errMsg = data.status
@@ -625,10 +681,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           scanned.length === 0 &&
           !data.isDirectMedia &&
           !isYouTubeExcludedUrl(finalUrl) &&
+          !isPlatformPage &&
           analyzePastedLink(finalUrl)?.category === 'PLATFORM_PAGE'
         ) {
           void extractMediaFromPageUrl(finalUrl).then((extracted) => {
-            if (extracted.ok && extracted.candidates.length > 0) {
+            if (!ctrl.signal.aborted && extracted.ok && extracted.candidates.length > 0) {
               mergeTabCandidates(tabId, extracted.candidates);
             }
           });
@@ -651,14 +708,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           prev.map((tab) => (tab.id === tabId ? { ...tab, url: finalUrl, title: pageTitle } : tab))
         );
 
-        const targetTab = tabs.find((item) => item.id === tabId);
-        if (!targetTab?.isPrivate) {
+        if (!isPrivateTab) {
           setHistory((prev) => [
             { id: makeId('hist'), title: pageTitle, url: finalUrl, visitedAt: Date.now() },
             ...prev.filter((h) => h.url !== finalUrl).slice(0, 199),
           ]);
         }
-      } catch {
+      } catch (err) {
+        if (ctrl.signal.aborted || (err instanceof DOMException && err.name === 'AbortError')) {
+          return;
+        }
         setTabPages((prev) => ({
           ...prev,
           [tabId]: {
@@ -671,9 +730,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             isDemoShowcase: false,
           },
         }));
+      } finally {
+        if (tabAbortRef.current.get(tabId) === ctrl) {
+          tabAbortRef.current.delete(tabId);
+        }
       }
     },
-    [settings.isCleartextAllowed, settings.isDesktopSite, settings.isAdBlockEnabled, settings.adBlockDisabledSites, tabs, t, logEvent, mergeTabCandidates]
+    [settings.isCleartextAllowed, settings.isDesktopSite, settings.isAdBlockEnabled, settings.adBlockDisabledSites, t, logEvent, mergeTabCandidates]
   );
 
   const navigateCurrentTab = useCallback(
@@ -796,6 +859,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   }, [currentTab, loadUrlIntoTab]);
 
   const stopLoadingCurrentTab = useCallback(() => {
+    tabAbortRef.current.get(currentTabId)?.abort();
+    tabAbortRef.current.delete(currentTabId);
     setTabPages((prev) => {
       const cur = prev[currentTabId];
       if (!cur) return prev;
@@ -875,6 +940,26 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const closeTab = useCallback(
     (tabId: string) => {
+      tabAbortRef.current.get(tabId)?.abort();
+      tabAbortRef.current.delete(tabId);
+      setTabPages((prev) => {
+        if (!(tabId in prev)) return prev;
+        const copy = { ...prev };
+        delete copy[tabId];
+        return copy;
+      });
+      setTabMedia((prev) => {
+        if (!(tabId in prev)) return prev;
+        const copy = { ...prev };
+        delete copy[tabId];
+        return copy;
+      });
+      setTabVisibleMedia((prev) => {
+        if (!(tabId in prev)) return prev;
+        const copy = { ...prev };
+        delete copy[tabId];
+        return copy;
+      });
       setTabs((prev) => {
         const remaining = prev.filter((item) => item.id !== tabId);
         if (remaining.length === 0) {
@@ -1252,6 +1337,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           url: playableUrl,
           title: target.mediaTitle || target.filename,
           downloadId: target.id,
+          isHls: Boolean(target.isHls && !liveBlob),
         },
       });
     },

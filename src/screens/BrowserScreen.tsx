@@ -688,6 +688,7 @@ export const BrowserScreen: React.FC = () => {
                                   player: {
                                     url: `/api/media/fetch?url=${encodeURIComponent(m.mediaUrl)}`,
                                     title: m.title,
+                                    isHls: true,
                                   },
                                 })
                               }

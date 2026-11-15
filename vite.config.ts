@@ -8,8 +8,33 @@ import {
   DEFAULT_USER_AGENT_MOBILE,
   extractMediaWithPatterns,
   hostMatchesBlocked,
+  unescapeEmbeddedText,
   validateRemoteUrl,
 } from './server/mediaExtractor';
+
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit = {},
+  timeoutMs = 15000,
+  headersOnlyTimeout = false
+): Promise<Response> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...init, signal: ctrl.signal });
+    if (headersOnlyTimeout) {
+      clearTimeout(timer);
+    }
+    return res;
+  } catch (err) {
+    clearTimeout(timer);
+    throw err;
+  } finally {
+    if (!headersOnlyTimeout) {
+      clearTimeout(timer);
+    }
+  }
+}
 
 function injectBrowserBridge(html: string, finalUrl: string, adBlock: boolean): { html: string; blockedCount: number } {
   let blockedCount = 0;
@@ -105,6 +130,14 @@ function injectBrowserBridge(html: string, finalUrl: string, adBlock: boolean): 
       list.push(entry);
     } catch (e) {}
   }
+  var scanTimer = null;
+  function scheduleScan() {
+    if (scanTimer) return;
+    scanTimer = setTimeout(function() {
+      scanTimer = null;
+      scanMedia();
+    }, 150);
+  }
   function scanMedia() {
     var items = [];
     document.querySelectorAll('video, audio').forEach(function(el) {
@@ -117,6 +150,25 @@ function injectBrowserBridge(html: string, finalUrl: string, adBlock: boolean): 
         var ssrc = s.getAttribute('src') || s.getAttribute('data-src') || s.getAttribute('data-lazy-src');
         if (ssrc) pushCandidate(items, ssrc, el.tagName.toLowerCase(), s.getAttribute('type') || '', false, classifyEl(el, ssrc));
       });
+    });
+    document.querySelectorAll('script[type="application/ld+json"]').forEach(function(sc) {
+      try {
+        var text = sc.textContent || '';
+        if (!text || text.length > 200000) return;
+        var parsed = JSON.parse(text);
+        var stack = Array.isArray(parsed) ? parsed.slice() : [parsed];
+        while (stack.length > 0) {
+          var node = stack.pop();
+          if (!node || typeof node !== 'object') continue;
+          if (typeof node.contentUrl === 'string') pushCandidate(items, node.contentUrl, 'video', node.encodingFormat || 'video/mp4', false, null);
+          if (typeof node.embedUrl === 'string' && isMediaUrl(node.embedUrl)) pushCandidate(items, node.embedUrl, 'video', '', false, null);
+          for (var k in node) {
+            if (Object.prototype.hasOwnProperty.call(node, k) && node[k] && typeof node[k] === 'object') {
+              stack.push(node[k]);
+            }
+          }
+        }
+      } catch (e) {}
     });
     if (window.performance && performance.getEntriesByType) {
       try {
@@ -155,11 +207,28 @@ function injectBrowserBridge(html: string, finalUrl: string, adBlock: boolean): 
       return origOpen.apply(this, arguments);
     };
   }
+  if (window.history) {
+    ['pushState', 'replaceState'].forEach(function(fnName) {
+      var orig = window.history[fnName];
+      if (typeof orig === 'function') {
+        window.history[fnName] = function() {
+          var ret = orig.apply(this, arguments);
+          PAGE_URL = window.location.href || PAGE_URL;
+          scheduleScan();
+          return ret;
+        };
+      }
+    });
+    window.addEventListener('popstate', function() {
+      PAGE_URL = window.location.href || PAGE_URL;
+      scheduleScan();
+    });
+  }
   if (window.MutationObserver) {
-    var obs = new MutationObserver(function() { scanMedia(); });
+    var obs = new MutationObserver(function() { scheduleScan(); });
     window.addEventListener('DOMContentLoaded', function() {
       scanMedia();
-      if (document.body) obs.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'data-src'] });
+      if (document.body) obs.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'data-src', 'data-video-src', 'data-mp4', 'data-hls'] });
     });
   } else {
     window.addEventListener('DOMContentLoaded', scanMedia);
@@ -256,14 +325,18 @@ function salviaMiddlewarePlugin(): Plugin {
           const desktop = parsedReq.searchParams.get('desktop') === '1';
           const adBlock = parsedReq.searchParams.get('adblock') === '1';
           try {
-            const response = await fetch(target.toString(), {
-              headers: {
-                'User-Agent': desktop ? DEFAULT_USER_AGENT_DESKTOP : DEFAULT_USER_AGENT_MOBILE,
-                Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.9',
+            const response = await fetchWithTimeout(
+              target.toString(),
+              {
+                headers: {
+                  'User-Agent': desktop ? DEFAULT_USER_AGENT_DESKTOP : DEFAULT_USER_AGENT_MOBILE,
+                  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                  'Accept-Language': 'en-US,en;q=0.9',
+                },
+                redirect: 'follow',
               },
-              redirect: 'follow',
-            });
+              15000
+            );
             const contentType = response.headers.get('content-type') || '';
             const finalUrl = response.url || target.toString();
             if (!response.ok) {
@@ -277,7 +350,7 @@ function salviaMiddlewarePlugin(): Plugin {
             if (contentType.includes('text/html') || contentType.includes('application/xhtml+xml') || contentType === '') {
               const rawHtml = await response.text();
               const titleMatch = rawHtml.match(/<title[^>]*>([^<]*)<\/title>/i);
-              const title = titleMatch ? titleMatch[1].trim() : new URL(finalUrl).hostname;
+              const title = titleMatch ? unescapeEmbeddedText(titleMatch[1]).trim() : new URL(finalUrl).hostname;
               const { html, blockedCount } = injectBrowserBridge(rawHtml, finalUrl, adBlock);
               return sendJson(res, 200, { ok: true, finalUrl, title, contentType, blockedCount, html });
             }
@@ -316,17 +389,25 @@ function salviaMiddlewarePlugin(): Plugin {
             reqHeaders.Origin = refererUrl.origin;
           }
           try {
-            let headRes = await fetch(target.toString(), {
-              method: 'HEAD',
-              headers: reqHeaders,
-              redirect: 'follow',
-            });
-            if (!headRes.ok || !headRes.headers.get('content-length')) {
-              headRes = await fetch(target.toString(), {
-                method: 'GET',
-                headers: { ...reqHeaders, Range: 'bytes=0-0' },
+            let headRes = await fetchWithTimeout(
+              target.toString(),
+              {
+                method: 'HEAD',
+                headers: reqHeaders,
                 redirect: 'follow',
-              });
+              },
+              10000
+            );
+            if (!headRes.ok || !headRes.headers.get('content-length')) {
+              headRes = await fetchWithTimeout(
+                target.toString(),
+                {
+                  method: 'GET',
+                  headers: { ...reqHeaders, Range: 'bytes=0-0' },
+                  redirect: 'follow',
+                },
+                10000
+              );
             }
             const contentType = headRes.headers.get('content-type') || '';
             const contentDisposition = headRes.headers.get('content-disposition') || '';
@@ -347,10 +428,14 @@ function salviaMiddlewarePlugin(): Plugin {
               contentType.includes('mpegurl') ||
               contentType.includes('dash+xml')
             ) {
-              const mRes = await fetch(target.toString(), {
-                headers: reqHeaders,
-                redirect: 'follow',
-              });
+              const mRes = await fetchWithTimeout(
+                target.toString(),
+                {
+                  headers: reqHeaders,
+                  redirect: 'follow',
+                },
+                12000
+              );
               if (mRes.ok) {
                 manifestText = await mRes.text();
               }
@@ -400,10 +485,15 @@ function salviaMiddlewarePlugin(): Plugin {
             if (req.headers.range) {
               upstreamHeaders.Range = String(req.headers.range);
             }
-            const upstream = await fetch(target.toString(), {
-              headers: upstreamHeaders,
-              redirect: 'follow',
-            });
+            const upstream = await fetchWithTimeout(
+              target.toString(),
+              {
+                headers: upstreamHeaders,
+                redirect: 'follow',
+              },
+              20000,
+              true
+            );
             res.statusCode = upstream.status;
             const ct = upstream.headers.get('content-type');
             const cl = upstream.headers.get('content-length');

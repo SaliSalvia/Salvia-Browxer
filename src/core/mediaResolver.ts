@@ -15,7 +15,7 @@ import {
 } from './mediaUrlRules';
 import type { UnsupportedMedia } from './mediaOfferability';
 import { apiUrl } from './nativeBridge';
-import { classifyUrlByPattern } from './linkPatternEngine';
+import { classifyUrlByPattern, isYouTubeUrl } from './linkPatternEngine';
 
 export function formatFileSize(bytes: number | null | undefined): string {
   if (bytes == null || !Number.isFinite(bytes) || bytes < 0) return '0 B';
@@ -49,6 +49,12 @@ export function formatDurationMs(ms: number): string {
   return formatDurationSeconds(ms / 1000);
 }
 
+export function formatBitrateKbps(bitrate: number | null | undefined): string | null {
+  if (bitrate == null || !Number.isFinite(bitrate) || bitrate <= 0) return null;
+  const kbps = bitrate > 100_000 ? Math.round(bitrate / 1000) : Math.round(bitrate);
+  return `${kbps} kbps`;
+}
+
 export function sanitizeFilename(raw: string | null | undefined): string {
   const cleaned = (raw || 'media')
     .replace(/[\\/:*?"<>|\u0000-\u001F]+/g, ' ')
@@ -67,8 +73,9 @@ function resolveRelativeUrl(base: string, maybeRelative: string): string | null 
 
 export function scanHtmlForMedia(html: string, pageUrl: string, pageTitle?: string): MediaCandidate[] {
   const candidates = new Map<string, MediaCandidate>();
-  const doc = new DOMParser().parseFromString(html, 'text/html');
-  const title = pageTitle || doc.title || pageUrl;
+  const doc = typeof DOMParser !== 'undefined' ? new DOMParser().parseFromString(html, 'text/html') : null;
+  const fallbackTitleMatch = !doc ? html.match(/<title[^>]*>([^<]*)<\/title>/i) : null;
+  const title = pageTitle || doc?.title || fallbackTitleMatch?.[1]?.trim() || pageUrl;
 
   const addCandidate = (
     rawUrl: string | null | undefined,
@@ -79,7 +86,7 @@ export function scanHtmlForMedia(html: string, pageUrl: string, pageTitle?: stri
     if (!rawUrl || rawUrl.startsWith('data:') || rawUrl.startsWith('javascript:')) return;
     const abs = resolveRelativeUrl(pageUrl, rawUrl.trim());
     if (!abs || (!abs.startsWith('http://') && !abs.startsWith('https://'))) return;
-    if (looksLikeNonMedia(abs) || looksLikeSegment(abs)) return;
+    if (isYouTubeUrl(abs) || looksLikeNonMedia(abs) || looksLikeSegment(abs)) return;
 
     const ext = pathExtension(abs) || extensionForMime(mimeType) || (isPlaylistUrl(abs, mimeType) ? 'm3u8' : null);
     const hasEvidence =
@@ -104,55 +111,57 @@ export function scanHtmlForMedia(html: string, pageUrl: string, pageTitle?: stri
     });
   };
 
-  doc.querySelectorAll('video, audio').forEach((el) => {
-    const tag = el.tagName.toLowerCase();
-    const defaultMime = tag === 'audio' ? 'audio/mpeg' : 'video/mp4';
-    const src =
-      el.getAttribute('src') ||
-      el.getAttribute('data-src') ||
-      el.getAttribute('data-lazy-src') ||
-      el.getAttribute('data-video-src') ||
-      el.getAttribute('data-mp4') ||
-      el.getAttribute('data-hls') ||
-      el.getAttribute('data-stream') ||
-      el.getAttribute('data-url');
-    addCandidate(src, el.getAttribute('type') || defaultMime, 0.88, el.getAttribute('title') || title);
-    el.querySelectorAll('source').forEach((source) => {
-      addCandidate(
-        source.getAttribute('src') || source.getAttribute('data-src') || source.getAttribute('data-lazy-src'),
-        source.getAttribute('type') || defaultMime,
-        0.86,
-        title
-      );
+  if (doc) {
+    doc.querySelectorAll('video, audio').forEach((el) => {
+      const tag = el.tagName.toLowerCase();
+      const defaultMime = tag === 'audio' ? 'audio/mpeg' : 'video/mp4';
+      const src =
+        el.getAttribute('src') ||
+        el.getAttribute('data-src') ||
+        el.getAttribute('data-lazy-src') ||
+        el.getAttribute('data-video-src') ||
+        el.getAttribute('data-mp4') ||
+        el.getAttribute('data-hls') ||
+        el.getAttribute('data-stream') ||
+        el.getAttribute('data-url');
+      addCandidate(src, el.getAttribute('type') || defaultMime, 0.88, el.getAttribute('title') || title);
+      el.querySelectorAll('source').forEach((source) => {
+        addCandidate(
+          source.getAttribute('src') || source.getAttribute('data-src') || source.getAttribute('data-lazy-src'),
+          source.getAttribute('type') || defaultMime,
+          0.86,
+          title
+        );
+      });
     });
-  });
 
-  doc.querySelectorAll('meta[property="og:video"], meta[property="og:video:url"], meta[property="og:video:secure_url"], meta[property="og:audio"], meta[name="twitter:player:stream"]').forEach((meta) => {
-    const content = meta.getAttribute('content');
-    const prop = meta.getAttribute('property') || '';
-    addCandidate(content, prop.includes('audio') ? 'audio/mpeg' : 'video/mp4', 0.8);
-  });
+    doc.querySelectorAll('meta[property="og:video"], meta[property="og:video:url"], meta[property="og:video:secure_url"], meta[property="og:audio"], meta[name="twitter:player:stream"]').forEach((meta) => {
+      const content = meta.getAttribute('content');
+      const prop = meta.getAttribute('property') || '';
+      addCandidate(content, prop.includes('audio') ? 'audio/mpeg' : 'video/mp4', 0.8);
+    });
 
-  doc.querySelectorAll('script[type="application/ld+json"]').forEach((script) => {
-    try {
-      const json = JSON.parse(script.textContent || '{}');
-      const items = Array.isArray(json) ? json : [json];
-      for (const item of items) {
-        if (item && typeof item.contentUrl === 'string') {
-          addCandidate(item.contentUrl, item.encodingFormat || 'video/mp4', 0.82, item.name || title);
+    doc.querySelectorAll('script[type="application/ld+json"]').forEach((script) => {
+      try {
+        const json = JSON.parse(script.textContent || '{}');
+        const items = Array.isArray(json) ? json : [json];
+        for (const item of items) {
+          if (item && typeof item.contentUrl === 'string') {
+            addCandidate(item.contentUrl, item.encodingFormat || 'video/mp4', 0.82, item.name || title);
+          }
         }
+      } catch {
+        // ignore invalid JSON-LD
       }
-    } catch {
-      // ignore invalid JSON-LD
-    }
-  });
+    });
 
-  doc.querySelectorAll('a[href]').forEach((anchor) => {
-    const href = anchor.getAttribute('href');
-    if (href && (hasMediaExtension(href) || isDashUrl(href))) {
-      addCandidate(href, null, 0.72, anchor.textContent?.trim() || title);
-    }
-  });
+    doc.querySelectorAll('a[href]').forEach((anchor) => {
+      const href = anchor.getAttribute('href');
+      if (href && (hasMediaExtension(href) || isDashUrl(href))) {
+        addCandidate(href, null, 0.72, anchor.textContent?.trim() || title);
+      }
+    });
+  }
 
   const unescapedHtml = html
     .replace(/\\u002F/gi, '/')
@@ -164,7 +173,7 @@ export function scanHtmlForMedia(html: string, pageUrl: string, pageTitle?: stri
     .replace(/&amp;/g, '&');
 
   const keyRegex =
-    /"(?:contentUrl|playbackUrl|playable_url(?:_quality_hd)?|browser_native_hd_url|browser_native_sd_url|hd_src(?:_no_ratelimit)?|sd_src(?:_no_ratelimit)?|video_url|playAddr|downloadAddr|fallback_url|hls_url|hls_manifest_url|dash_url|mp4_url|file|src)"\s*:\s*"(https?:\/\/[^"]+)"/gi;
+    /"(?:contentUrl|playbackUrl|playable_url(?:_quality_hd)?|browser_native_hd_url|browser_native_sd_url|hd_src(?:_no_ratelimit)?|sd_src(?:_no_ratelimit)?|video_url|video_hls_url|playAddr|downloadAddr|fallback_url|hls_url|hls_manifest_url|dash_url|dashManifestUrl|playlistUrl|manifestUrl|streamUrl|mediaUrl|mp4_url|hdUrl|sdUrl|file|src)"\s*:\s*"(https?:\/\/[^"]+)"/gi;
   let km: RegExpExecArray | null;
   while ((km = keyRegex.exec(unescapedHtml)) !== null) {
     addCandidate(km[1], null, 0.84, title);

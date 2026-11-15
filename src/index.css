@@ -1,30 +1,189 @@
 @import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
 
-@layer base {
-  :root {
-    --font-sans: "Vazirmatn", "Outfit", system-ui, -apple-system, sans-serif;
-    --font-display: "Outfit", "Vazirmatn", system-ui, sans-serif;
-    --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-  }
+@font-face {
+  font-family: "Vazirmatn";
+  src: url("/fonts/vazirmatn_regular.ttf") format("truetype");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
 
-  body {
-    font-family: var(--font-sans);
-    background-color: #f8fafc;
-    color: #0f172a;
-  }
+@font-face {
+  font-family: "Vazirmatn";
+  src: url("/fonts/vazirmatn_medium.ttf") format("truetype");
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
 
-  code,
-  pre,
-  .font-mono {
-    font-family: var(--font-mono);
-    font-variant-numeric: tabular-nums;
-  }
+@font-face {
+  font-family: "Vazirmatn";
+  src: url("/fonts/vazirmatn_bold.ttf") format("truetype");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root {
+  --salvia-matte-charcoal: #000000;
+  --salvia-deep-cosmic: #070510;
+  --salvia-surface: #100c20;
+  --salvia-elevated: #18122e;
+  --salvia-border: #312556;
+  --salvia-pearl: #f4f2ff;
+  --salvia-silver-mid: #a6acc4;
+  --salvia-silver-deep: #7f86a3;
+  --salvia-iris: #8f6bff;
+  --salvia-iris-light: #c3aeff;
+  --salvia-iris-deep: #5a34d9;
+  --salvia-cyan: #4cc4ff;
+  --salvia-cyan-light: #a8e6ff;
+  --salvia-cyan-container: #0b2c44;
+  --salvia-gold: #d9ae54;
+  --salvia-gold-bright: #f2cd72;
+  --salvia-pink: #ef7bf0;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  background-color: #000000;
+  color: #f4f2ff;
+  font-family: "Plus Jakarta Sans", "Outfit", system-ui, -apple-system, sans-serif;
 }
 
 .font-display {
-  font-family: var(--font-display);
+  font-family: "Outfit", "Plus Jakarta Sans", system-ui, sans-serif;
+}
+
+.font-data {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+html[dir="rtl"],
+html[dir="rtl"] body,
+html[dir="rtl"] #root,
+html[dir="rtl"] .font-display {
+  font-family: "Vazirmatn", "Plus Jakarta Sans", system-ui, sans-serif;
+  letter-spacing: 0 !important;
+  line-height: 1.72;
 }
 
 .tabular-nums {
   font-variant-numeric: tabular-nums;
+}
+
+@layer base {
+  *:focus-visible {
+    outline: 2px solid #4cc4ff;
+    outline-offset: 2px;
+  }
+}
+
+/* Custom sleek dark scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(143, 107, 255, 0.28);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(76, 196, 255, 0.45);
+}
+
+@keyframes salviaSplashBreath {
+  0% {
+    opacity: 0;
+    transform: scale(0.92);
+  }
+  40% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  70% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.04);
+  }
+}
+
+@keyframes salviaHaloBreath {
+  0% {
+    opacity: 0;
+  }
+  45% {
+    opacity: 0.72;
+  }
+  70% {
+    opacity: 0.72;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+@keyframes salviaSpinSlow {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes salviaFloatingWake {
+  0% {
+    transform: scale(0.84);
+    box-shadow: 0 0 0 0 rgba(76, 196, 255, 0.72), 0 0 0 0 rgba(143, 107, 255, 0.45);
+  }
+  45% {
+    transform: scale(1.14);
+    box-shadow: 0 0 28px 10px rgba(76, 196, 255, 0.42), 0 0 0 14px rgba(143, 107, 255, 0);
+  }
+  75% {
+    transform: scale(0.97);
+  }
+  100% {
+    transform: scale(1);
+    box-shadow: 0 10px 30px rgba(143, 107, 255, 0.48), 0 0 18px rgba(76, 196, 255, 0.25);
+  }
+}
+
+.animate-salvia-splash {
+  animation: salviaSplashBreath 1250ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.animate-salvia-halo {
+  animation: salviaHaloBreath 1250ms ease-in-out forwards;
+}
+
+.animate-salvia-comet {
+  animation: salviaSpinSlow 2400ms linear infinite;
+}
+
+.animate-salvia-wake {
+  animation: salviaFloatingWake 700ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-salvia-splash,
+  .animate-salvia-halo,
+  .animate-salvia-comet,
+  .animate-salvia-wake {
+    animation-duration: 1ms !important;
+  }
 }

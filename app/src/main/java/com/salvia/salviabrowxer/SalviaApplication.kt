@@ -4,11 +4,22 @@ import android.app.Application
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.os.Build
+import com.salvia.salviabrowxer.core.NativeProxyClient
 
 class SalviaApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         createDownloadChannel()
+        Thread {
+            try {
+                NativeProxyClient.httpClient.connectionPool
+            } catch (_: Exception) {
+            }
+        }.apply {
+            name = "salvia-warmup"
+            isDaemon = true
+            start()
+        }
     }
 
     private fun createDownloadChannel() {

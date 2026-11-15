@@ -24,8 +24,23 @@ object BrowserBridgeInjector {
         val blockedCount: Int
     )
 
+    private fun decodeBasicEntities(raw: String): String {
+        return raw
+            .replace("&amp;", "&", ignoreCase = true)
+            .replace("&#38;", "&")
+            .replace("&quot;", "\"", ignoreCase = true)
+            .replace("&#039;", "'")
+            .replace("&#39;", "'")
+            .replace("&#x27;", "'", ignoreCase = true)
+            .replace("&#x2F;", "/", ignoreCase = true)
+            .replace("&lt;", "<", ignoreCase = true)
+            .replace("&gt;", ">", ignoreCase = true)
+    }
+
     fun inject(rawHtml: String, finalUrl: String, adBlock: Boolean): InjectedResult {
-        val title = titleRegex.find(rawHtml)?.groupValues?.getOrNull(1)?.trim()?.takeIf { it.isNotEmpty() }
+        val title = titleRegex.find(rawHtml)?.groupValues?.getOrNull(1)
+            ?.let { decodeBasicEntities(it).trim() }
+            ?.takeIf { it.isNotEmpty() }
         var blockedCount = 0
         var cleaned = rawHtml
             .replace(cspMetaRegex, "")
@@ -127,6 +142,14 @@ object BrowserBridgeInjector {
       list.push(entry);
     } catch (e) {}
   }
+  var scanTimer = null;
+  function scheduleScan() {
+    if (scanTimer) return;
+    scanTimer = setTimeout(function() {
+      scanTimer = null;
+      scanMedia();
+    }, 150);
+  }
   function scanMedia() {
     var items = [];
     document.querySelectorAll('video, audio').forEach(function(el) {
@@ -139,6 +162,25 @@ object BrowserBridgeInjector {
         var ssrc = s.getAttribute('src') || s.getAttribute('data-src') || s.getAttribute('data-lazy-src');
         if (ssrc) pushCandidate(items, ssrc, el.tagName.toLowerCase(), s.getAttribute('type') || '', false, classifyEl(el, ssrc));
       });
+    });
+    document.querySelectorAll('script[type="application/ld+json"]').forEach(function(sc) {
+      try {
+        var text = sc.textContent || '';
+        if (!text || text.length > 200000) return;
+        var parsed = JSON.parse(text);
+        var stack = Array.isArray(parsed) ? parsed.slice() : [parsed];
+        while (stack.length > 0) {
+          var node = stack.pop();
+          if (!node || typeof node !== 'object') continue;
+          if (typeof node.contentUrl === 'string') pushCandidate(items, node.contentUrl, 'video', node.encodingFormat || 'video/mp4', false, null);
+          if (typeof node.embedUrl === 'string' && isMediaUrl(node.embedUrl)) pushCandidate(items, node.embedUrl, 'video', '', false, null);
+          for (var k in node) {
+            if (Object.prototype.hasOwnProperty.call(node, k) && node[k] && typeof node[k] === 'object') {
+              stack.push(node[k]);
+            }
+          }
+        }
+      } catch (e) {}
     });
     if (window.performance && performance.getEntriesByType) {
       try {
@@ -177,8 +219,25 @@ object BrowserBridgeInjector {
       return origOpen.apply(this, arguments);
     };
   }
+  if (window.history) {
+    ['pushState', 'replaceState'].forEach(function(fnName) {
+      var orig = window.history[fnName];
+      if (typeof orig === 'function') {
+        window.history[fnName] = function() {
+          var ret = orig.apply(this, arguments);
+          PAGE_URL = window.location.href || PAGE_URL;
+          scheduleScan();
+          return ret;
+        };
+      }
+    });
+    window.addEventListener('popstate', function() {
+      PAGE_URL = window.location.href || PAGE_URL;
+      scheduleScan();
+    });
+  }
   if (window.MutationObserver) {
-    var obs = new MutationObserver(function() { scanMedia(); });
+    var obs = new MutationObserver(function() { scheduleScan(); });
     window.addEventListener('DOMContentLoaded', function() {
       scanMedia();
       if (document.body) obs.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'data-src', 'data-video-src', 'data-mp4', 'data-hls'] });

@@ -7,6 +7,7 @@ import android.content.pm.PackageManager
 import android.graphics.Color
 import android.os.Build
 import android.os.Bundle
+import android.view.View
 import android.webkit.CookieManager
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
@@ -45,9 +46,15 @@ class MainActivity : AppCompatActivity() {
 
         webView = WebView(this).apply {
             setBackgroundColor(Color.BLACK)
+            setLayerType(View.LAYER_TYPE_HARDWARE, null)
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
             settings.databaseEnabled = true
+            settings.cacheMode = WebSettings.LOAD_DEFAULT
+            settings.useWideViewPort = true
+            settings.loadWithOverviewMode = true
+            settings.builtInZoomControls = true
+            settings.displayZoomControls = false
             settings.mediaPlaybackRequiresUserGesture = false
             settings.allowFileAccess = false
             settings.allowContentAccess = true
@@ -126,6 +133,14 @@ class MainActivity : AppCompatActivity() {
             val quoted = JSONObject.quote(incoming)
             webView.evaluateJavascript("window.__salviaOpenUrl && window.__salviaOpenUrl($quoted);", null)
         }
+    }
+
+    override fun onPause() {
+        try {
+            CookieManager.getInstance().flush()
+        } catch (_: Exception) {
+        }
+        super.onPause()
     }
 
     override fun onDestroy() {

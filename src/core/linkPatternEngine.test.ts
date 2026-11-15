@@ -161,3 +161,26 @@ test('extractMediaWithPatterns rejects YouTube immediately without network calls
   assert.equal(res.error, 'YOUTUBE_EXCLUDED');
   assert.equal(res.items.length, 0);
 });
+
+test('unescapeEmbeddedText and collectUrlsFromHtml handle hex escapes, HTML entities, and expanded CDN keys', () => {
+  assert.equal(
+    unescapeEmbeddedText('https\\x3A\\x2F\\x2Fcdn.example.com\\x2Fv.mp4\\x3Fid\\x3D9&#38;q=1'),
+    'https://cdn.example.com/v.mp4?id=9&q=1'
+  );
+  assert.equal(unescapeEmbeddedText('Title &quot;Hero&quot; &#39;Clip&#39;'), 'Title "Hero" \'Clip\'');
+
+  const html = `
+    <script>
+      {
+        "video_hls_url": "https://stream.example.org/adaptive/index.m3u8",
+        "hdUrl": "https://cdn.example.org/files/movie_1080",
+        "dashManifestUrl": "https://stream.example.org/dash/manifest.mpd"
+      }
+    </script>
+  `;
+  const found = new Map<string, ExtractedMediaItem>();
+  collectUrlsFromHtml(html, 'https://example.org/post/42', found);
+  assert.ok(found.has('https://stream.example.org/adaptive/index.m3u8'));
+  assert.equal(found.get('https://cdn.example.org/files/movie_1080')?.format, 'HD MP4');
+  assert.ok(found.has('https://stream.example.org/dash/manifest.mpd'));
+});

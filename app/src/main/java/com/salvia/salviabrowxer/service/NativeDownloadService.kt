@@ -51,7 +51,7 @@ class NativeDownloadService : Service() {
     )
 
     private val jobs = ConcurrentHashMap<String, JobState>()
-    private val pool = Executors.newCachedThreadPool()
+    private val pool = Executors.newFixedThreadPool(12)
     private val notifId = 4101
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -157,6 +157,7 @@ class NativeDownloadService : Service() {
         val partsDir = File(downloadsDir, "parts_$safeStorageId")
         val startedAt = System.currentTimeMillis()
         var lastReportAt = 0L
+        var lastNotifAt = 0L
 
         fun reportProgress(downloaded: Long, total: Long?, force: Boolean = false) {
             val now = System.currentTimeMillis()
@@ -174,7 +175,10 @@ class NativeDownloadService : Service() {
             } else {
                 -1
             }
-            updateNotification(job.filename, pct)
+            if (force || now - lastNotifAt >= 800L) {
+                lastNotifAt = now
+                updateNotification(job.filename, pct)
+            }
             NativeDownloadBus.emit(
                 JSONObject()
                     .put("type", "progress")
@@ -386,16 +390,20 @@ class NativeDownloadService : Service() {
                 }
             }
             latch.await()
-            failure.get()?.let { throw it }
+            val chunkErr = failure.get()
             if (job.paused.get() || job.cancelled.get()) return detectedMime
-
-            outFile.outputStream().use { finalOut ->
-                for (range in ranges) {
-                    val partFile = File(partsDir, "chunk_${range.index}.part")
-                    partFile.inputStream().use { it.copyTo(finalOut, 64 * 1024) }
+            if (chunkErr == null) {
+                outFile.outputStream().use { finalOut ->
+                    for (range in ranges) {
+                        val partFile = File(partsDir, "chunk_${range.index}.part")
+                        partFile.inputStream().use { it.copyTo(finalOut, 64 * 1024) }
+                        partFile.delete()
+                    }
                 }
+                return detectedMime
             }
-            return detectedMime
+            // Server rejected or broke concurrent range chunks — fall back cleanly to single-stream GET
+            partsDir.deleteRecursively()
         }
 
         // Single-stream with byte-offset resume support when Accept-Ranges is available
@@ -461,10 +469,13 @@ class NativeDownloadService : Service() {
         referer: String?,
         onProgress: (Long, Long?) -> Unit
     ) {
-        val rawManifestText = fetchText(job, playlistUrl, referer)
-        val variantUrl = RangeChunkPlanner.selectBestMasterVariantUrl(rawManifestText, playlistUrl)
-        val effectiveUrl = variantUrl ?: playlistUrl
-        val manifestText = if (variantUrl != null) fetchText(job, variantUrl, referer) else rawManifestText
+        var effectiveUrl = playlistUrl
+        var manifestText = fetchText(job, effectiveUrl, referer)
+        for (hop in 0 until 2) {
+            val nextVariant = RangeChunkPlanner.selectBestMasterVariantUrl(manifestText, effectiveUrl) ?: break
+            effectiveUrl = nextVariant
+            manifestText = fetchText(job, effectiveUrl, referer)
+        }
 
         val entries = HlsKeyParser.parsePlaylistEntries(manifestText, effectiveUrl)
         if (entries.isEmpty()) throw IllegalStateException("Empty playlist")
@@ -475,6 +486,7 @@ class NativeDownloadService : Service() {
         try {
             val segFiles = Array<File?>(entries.size) { null }
             val nextIndex = AtomicInteger(0)
+            val completedSegments = AtomicInteger(0)
             val downloaded = AtomicLong(0L)
             val failure = AtomicReference<Throwable?>(null)
             val workers = minOf(4, entries.size)
@@ -518,7 +530,8 @@ class NativeDownloadService : Service() {
                             segFiles[idx] = segFile
 
                             val nowDl = downloaded.addAndGet(finalBytes.size.toLong())
-                            val estTotal = ((nowDl.toDouble() / (idx + 1)) * entries.size).toLong()
+                            val doneCount = completedSegments.incrementAndGet()
+                            val estTotal = ((nowDl.toDouble() / doneCount) * entries.size).toLong()
                             onProgress(nowDl, estTotal)
                         }
                     } catch (t: Throwable) {
@@ -535,8 +548,11 @@ class NativeDownloadService : Service() {
 
             val rawMergedTs = File(tempDir, "merged_video.ts")
             rawMergedTs.outputStream().use { out ->
-                for (seg in segFiles) {
-                    seg?.inputStream()?.use { it.copyTo(out, 32 * 1024) }
+                for (i in segFiles.indices) {
+                    val seg = segFiles[i] ?: continue
+                    seg.inputStream().use { it.copyTo(out, 32 * 1024) }
+                    seg.delete()
+                    segFiles[i] = null
                 }
             }
 
@@ -554,12 +570,14 @@ class NativeDownloadService : Service() {
                         if (!remuxed) rawMergedTs.copyTo(outFile, overwrite = true)
                     }
                 }
+                audioFile.delete()
             } else {
                 val remuxed = NativeMediaMuxer.remuxToMp4(rawMergedTs, outFile)
                 if (!remuxed) {
                     rawMergedTs.copyTo(outFile, overwrite = true)
                 }
             }
+            rawMergedTs.delete()
         } finally {
             tempDir.deleteRecursively()
         }

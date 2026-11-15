@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { classifyPastedLink, pastedMediaCandidate } from './pastedLink';
 import { resolveAddressBarInput, extractFirstSharedUrl } from './addressBarResolver';
 import { isBlockedAdHost, hostOfUrl } from './adBlockRules';
-import { parseHlsPlaylist, sanitizeFilename } from './mediaResolver';
+import { formatBitrateKbps, parseHlsPlaylist, sanitizeFilename, scanHtmlForMedia } from './mediaResolver';
 import { selectMainCandidate, rankAndClassifyCandidates } from './mainContentSelector';
 import { snapFloatingPosition } from './floatingSnap';
 import { unsupportedReasonFor } from './mediaOfferability';
@@ -189,4 +189,29 @@ test('snapFloatingPosition snaps magnetically to nearest horizontal edge and cla
 
   const clampedY = snapFloatingPosition(10, 950, 400, 800, 56, 14);
   assert.deepEqual(clampedY, { x: 14, y: 730 });
+});
+
+test('formatBitrateKbps handles normalized kbps values without double division and converts large raw bps', () => {
+  assert.equal(formatBitrateKbps(1200), '1200 kbps');
+  assert.equal(formatBitrateKbps(2500), '2500 kbps');
+  assert.equal(formatBitrateKbps(1500000), '1500 kbps');
+  assert.equal(formatBitrateKbps(0), null);
+  assert.equal(formatBitrateKbps(null), null);
+  assert.equal(formatBitrateKbps(undefined), null);
+});
+
+test('scanHtmlForMedia extracts expanded player JSON keys while rejecting YouTube URLs', () => {
+  const html = `
+    <script>
+      window.__PLAYER_DATA__ = {
+        "video_hls_url": "https:\\u002F\\u002Fcdn.example.net\\u002Fhls\\u002Fmaster.m3u8",
+        "hdUrl": "https://cdn.example.net/video/hd_clip.mp4",
+        "contentUrl": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+      };
+    </script>
+  `;
+  const results = scanHtmlForMedia(html, 'https://example.net/watch/1');
+  assert.ok(results.some((c) => c.mediaUrl === 'https://cdn.example.net/hls/master.m3u8'));
+  assert.ok(results.some((c) => c.mediaUrl === 'https://cdn.example.net/video/hd_clip.mp4'));
+  assert.equal(results.some((c) => c.mediaUrl.includes('youtube.com')), false);
 });

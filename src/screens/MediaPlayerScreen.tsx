@@ -72,25 +72,42 @@ export const MediaPlayerScreen: React.FC = () => {
     setDuration(0);
 
     let hls: Hls | null = null;
-    const isHlsSource = activeUrl.toLowerCase().includes('.m3u8');
+    const isHlsSource = Boolean(playerTarget?.isHls) || activeUrl.toLowerCase().includes('.m3u8');
 
     if (isHlsSource && Hls.isSupported()) {
-      hls = new Hls();
+      hls = new Hls({ enableWorker: true, lowLatencyMode: false });
+      let networkRecovered = false;
+      let mediaRecovered = false;
       hls.loadSource(activeUrl);
       hls.attachMedia(video);
       hls.on(Hls.Events.ERROR, (_ev, data) => {
-        if (data.fatal) {
-          setLoadError(t('player_playback_failed'));
+        if (!data.fatal) return;
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR && !networkRecovered) {
+          networkRecovered = true;
+          hls?.startLoad();
+          return;
         }
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR && !mediaRecovered) {
+          mediaRecovered = true;
+          hls?.recoverMediaError();
+          return;
+        }
+        setLoadError(t('player_playback_failed'));
       });
     } else {
       video.src = activeUrl;
     }
 
     return () => {
-      if (hls) hls.destroy();
+      if (hls) {
+        hls.destroy();
+      } else {
+        video.pause();
+        video.removeAttribute('src');
+        video.load();
+      }
     };
-  }, [activeUrl, t]);
+  }, [activeUrl, playerTarget?.isHls, t]);
 
   useEffect(() => {
     if (videoRef.current) videoRef.current.playbackRate = speed;

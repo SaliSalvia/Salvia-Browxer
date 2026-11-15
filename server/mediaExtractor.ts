@@ -108,9 +108,16 @@ export function unescapeEmbeddedText(raw: string): string {
     .replace(/\\u0025/gi, '%')
     .replace(/\\u003C/gi, '<')
     .replace(/\\u003E/gi, '>')
+    .replace(/\\x2F/gi, '/')
+    .replace(/\\x3A/gi, ':')
+    .replace(/\\x26/gi, '&')
+    .replace(/\\x3D/gi, '=')
+    .replace(/\\x3F/gi, '?')
     .replace(/\\\//g, '/')
     .replace(/&#x2F;/gi, '/')
-    .replace(/&#38;|&amp;/gi, '&');
+    .replace(/&#38;|&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#0*39;|&#x0*27;/gi, "'");
 }
 
 export function collectUrlsFromHtml(
@@ -140,9 +147,9 @@ export function collectUrlsFromHtml(
     addItem(m, 'JS');
   }
 
-  // 2. Named JSON video/stream keys (including Instagram, Facebook, TikTok, Reddit, JWPlayer)
+  // 2. Named JSON video/stream keys (including Instagram, Facebook, TikTok, Reddit, JWPlayer, generic CDNs)
   const keyRegex =
-    /"(?:contentUrl|playbackUrl|playable_url(?:_quality_hd)?|browser_native_hd_url|browser_native_sd_url|hd_src(?:_no_ratelimit)?|sd_src(?:_no_ratelimit)?|video_url|playAddr|downloadAddr|fallback_url|hls_url|hls_manifest_url|dash_url|mp4_url|file|src)"\s*:\s*"(https?:\/\/[^"]+)"/gi;
+    /"(?:contentUrl|playbackUrl|playable_url(?:_quality_hd)?|browser_native_hd_url|browser_native_sd_url|hd_src(?:_no_ratelimit)?|sd_src(?:_no_ratelimit)?|video_url|video_hls_url|playAddr|downloadAddr|fallback_url|hls_url|hls_manifest_url|dash_url|dashManifestUrl|playlistUrl|manifestUrl|streamUrl|mediaUrl|hdUrl|sdUrl|mp4_url|file|src)"\s*:\s*"(https?:\/\/[^"]+)"/gi;
   let km: RegExpExecArray | null;
   while ((km = keyRegex.exec(unescaped)) !== null) {
     const k = km[0].toLowerCase();
@@ -281,11 +288,27 @@ async function extractXTwitter(pattern: LinkPatternMatch): Promise<ExtractionRes
 
   if (!tweetId) return null;
 
-  // Strategy 1: FxTwitter public JSON API (all MP4 variants + HLS + thumbnail)
-  const fx = (await fetchJsonWithTimeout(`https://api.fxtwitter.com/status/${tweetId}`, {
-    'User-Agent': 'SalviaBrowxer/1.0',
-    Accept: 'application/json',
-  })) as {
+  // Run FxTwitter, VxTwitter, and official Syndication concurrently to eliminate sequential timeouts
+  const token = syndicationTokenForTweetId(tweetId);
+  const [fxRaw, vxRaw, synRaw] = await Promise.all([
+    fetchJsonWithTimeout(`https://api.fxtwitter.com/status/${tweetId}`, {
+      'User-Agent': 'SalviaBrowxer/1.0',
+      Accept: 'application/json',
+    }),
+    fetchJsonWithTimeout(`https://api.vxtwitter.com/Twitter/status/${tweetId}`, {
+      'User-Agent': 'SalviaBrowxer/1.0',
+      Accept: 'application/json',
+    }),
+    fetchJsonWithTimeout(
+      `https://cdn.syndication.twimg.com/tweet-result?id=${tweetId}&lang=en&token=${token}`,
+      {
+        'User-Agent': DEFAULT_USER_AGENT_DESKTOP,
+        Accept: 'application/json',
+      }
+    ),
+  ]);
+
+  const fx = fxRaw as {
     tweet?: {
       text?: string;
       author?: { name?: string; screen_name?: string };
@@ -376,11 +399,7 @@ async function extractXTwitter(pattern: LinkPatternMatch): Promise<ExtractionRes
     }
   }
 
-  // Strategy 2: VxTwitter public API fallback
-  const vx = (await fetchJsonWithTimeout(`https://api.vxtwitter.com/Twitter/status/${tweetId}`, {
-    'User-Agent': 'SalviaBrowxer/1.0',
-    Accept: 'application/json',
-  })) as {
+  const vx = vxRaw as {
     text?: string;
     user_screen_name?: string;
     media_extended?: Array<{
@@ -423,15 +442,7 @@ async function extractXTwitter(pattern: LinkPatternMatch): Promise<ExtractionRes
     }
   }
 
-  // Strategy 3: Twitter official public syndication endpoint
-  const token = syndicationTokenForTweetId(tweetId);
-  const syn = (await fetchJsonWithTimeout(
-    `https://cdn.syndication.twimg.com/tweet-result?id=${tweetId}&lang=en&token=${token}`,
-    {
-      'User-Agent': DEFAULT_USER_AGENT_DESKTOP,
-      Accept: 'application/json',
-    }
-  )) as {
+  const syn = synRaw as {
     text?: string;
     user?: { screen_name?: string };
     video?: {
@@ -504,16 +515,27 @@ async function extractInstagram(pattern: LinkPatternMatch): Promise<ExtractionRe
     candidateUrls.push(`https://d.ddinstagram.com/${kind}/${shortcode}`);
   }
 
-  for (const probeUrl of candidateUrls) {
-    const res = await fetchTextWithTimeout(probeUrl, {
-      'User-Agent': probeUrl.includes('ddinstagram')
-        ? 'TelegramBot (like TwitterBot)'
-        : DEFAULT_USER_AGENT_MOBILE,
-      Accept: 'text/html,application/json,application/xhtml+xml;q=0.9,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Sec-Fetch-Site': 'none',
-      'Sec-Fetch-Mode': 'navigate',
-    });
+  const probeResults = await Promise.allSettled(
+    candidateUrls.map((probeUrl) =>
+      fetchTextWithTimeout(
+        probeUrl,
+        {
+          'User-Agent': probeUrl.includes('ddinstagram')
+            ? 'TelegramBot (like TwitterBot)'
+            : DEFAULT_USER_AGENT_MOBILE,
+          Accept: 'text/html,application/json,application/xhtml+xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Sec-Fetch-Site': 'none',
+          'Sec-Fetch-Mode': 'navigate',
+        },
+        7500
+      )
+    )
+  );
+
+  for (const settled of probeResults) {
+    if (settled.status !== 'fulfilled') continue;
+    const res = settled.value;
     if (!res?.ok || !res.text) continue;
 
     if (res.text.trim().startsWith('{')) {
@@ -525,17 +547,17 @@ async function extractInstagram(pattern: LinkPatternMatch): Promise<ExtractionRe
       if (!thumbnail && meta.thumbnail) thumbnail = meta.thumbnail;
       collectUrlsFromHtml(res.text, res.finalUrl, found);
     }
+  }
 
-    if (found.size > 0) {
-      const items = Array.from(found.values()).sort((a, b) => (b.height ?? 0) - (a.height ?? 0));
-      return {
-        ok: true,
-        finalUrl: pattern.canonicalUrl,
-        title,
-        thumbnail,
-        items,
-      };
-    }
+  if (found.size > 0) {
+    const items = Array.from(found.values()).sort((a, b) => (b.height ?? 0) - (a.height ?? 0));
+    return {
+      ok: true,
+      finalUrl: pattern.canonicalUrl,
+      title,
+      thumbnail,
+      items,
+    };
   }
 
   return null;
@@ -957,14 +979,20 @@ export async function extractMediaWithPatterns(rawUrl: string): Promise<Extracti
       }
     }
 
-    for (const iframeUrl of iframeMatches) {
-      const ir = await fetchTextWithTimeout(
-        iframeUrl,
-        { 'User-Agent': DEFAULT_USER_AGENT_MOBILE, Referer: finalUrl },
-        7000
+    if (iframeMatches.length > 0) {
+      const iframeResults = await Promise.allSettled(
+        iframeMatches.map((iframeUrl) =>
+          fetchTextWithTimeout(
+            iframeUrl,
+            { 'User-Agent': DEFAULT_USER_AGENT_MOBILE, Referer: finalUrl },
+            6500
+          )
+        )
       );
-      if (ir?.ok && ir.text) {
-        collectUrlsFromHtml(ir.text, ir.finalUrl, found);
+      for (const settled of iframeResults) {
+        if (settled.status === 'fulfilled' && settled.value?.ok && settled.value.text) {
+          collectUrlsFromHtml(settled.value.text, settled.value.finalUrl, found);
+        }
       }
     }
 
