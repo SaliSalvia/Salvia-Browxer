@@ -34,6 +34,7 @@ import { OrbitalBrandMark } from '../components/OrbitalBrandMark';
 import { BUILTIN_SHOWCASE_PAGES } from '../core/constants';
 import { hostOfUrl } from '../core/adBlockRules';
 import { formatDurationSeconds, formatFileSize } from '../core/mediaResolver';
+import { getSalviaNative } from '../core/nativeBridge';
 import { useApp } from '../store/AppContext';
 
 export const BrowserScreen: React.FC = () => {
@@ -70,7 +71,12 @@ export const BrowserScreen: React.FC = () => {
     getAddressSuggestions,
     currentTabCandidates,
     openMediaTray,
+    isMediaTrayVisible,
+    qualitySheet,
+    isTabSwitcherVisible,
     openQualitySheetForCandidate,
+    downloadMainMedia,
+    currentMainCandidate,
     activeDownloadsCount,
     completedDownloadsCount,
     findInPage,
@@ -78,6 +84,8 @@ export const BrowserScreen: React.FC = () => {
     closeFindInPage,
     updateFindQuery,
     setFindResult,
+    isNativeBrowserEngine,
+    nativeNavCaps,
     pageZoom,
     setPageZoom,
     reportDetectedMediaFromBridge,
@@ -177,19 +185,129 @@ export const BrowserScreen: React.FC = () => {
     setFindResult,
   ]);
 
+  const showcasePage = page?.isDemoShowcase
+    ? BUILTIN_SHOWCASE_PAGES.find((p) => p.url === page.url) || BUILTIN_SHOWCASE_PAGES[0]
+    : null;
+
+  const suggestions = addressFocused ? getAddressSuggestions(addressInput) : [];
+  const isHttps = (currentTab.url || '').startsWith('https://');
+  const isHttp = (currentTab.url || '').startsWith('http://');
+  const canGoBack =
+    currentTab.historyIndex > 0 || Boolean(nativeNavCaps[currentTab.id]?.canGoBack);
+  const canGoForward =
+    currentTab.historyIndex < currentTab.historyStack.length - 1 ||
+    Boolean(nativeNavCaps[currentTab.id]?.canGoForward);
+
+  const isNativeWebViewTarget =
+    isNativeBrowserEngine &&
+    Boolean(currentTab.url) &&
+    !showcasePage &&
+    !page?.error;
+  const hasCoveringOverlay =
+    menuOpen ||
+    (addressFocused && suggestions.length > 0) ||
+    isMediaTrayVisible ||
+    qualitySheet !== null ||
+    isTabSwitcherVisible ||
+    Boolean(blockedCleartextUrl);
+  const nativeViewportVisible = isNativeWebViewTarget && !hasCoveringOverlay;
+
   const sendFindToIframe = (query: string, backwards = false) => {
     updateFindQuery(query);
+    if (isNativeWebViewTarget) {
+      getSalviaNative()?.nativeFindInPage?.(query, backwards);
+      return;
+    }
     iframeRef.current?.contentWindow?.postMessage(
       { target: 'salvia-iframe', type: 'find', query, backwards },
       '*'
     );
   };
 
-  const suggestions = addressFocused ? getAddressSuggestions(addressInput) : [];
-  const isHttps = (currentTab.url || '').startsWith('https://');
-  const isHttp = (currentTab.url || '').startsWith('http://');
-  const canGoBack = currentTab.historyIndex > 0;
-  const canGoForward = currentTab.historyIndex < currentTab.historyStack.length - 1;
+  // Keep Android native Chromium WebView synchronized with React viewport box & modal occlusion
+  useEffect(() => {
+    if (!isNativeBrowserEngine) return;
+    const native = getSalviaNative();
+    if (!native?.setBrowserViewport) return;
+
+    const syncRect = () => {
+      const el = viewportRef.current;
+      if (!el || !nativeViewportVisible) {
+        native.setBrowserViewport?.(false, 0, 0, 0, 0);
+        return;
+      }
+      const rect = el.getBoundingClientRect();
+      native.setBrowserViewport?.(true, rect.left, rect.top, rect.width, rect.height);
+    };
+
+    syncRect();
+    let observer: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== 'undefined' && viewportRef.current) {
+      observer = new ResizeObserver(syncRect);
+      observer.observe(viewportRef.current);
+    }
+    window.addEventListener('resize', syncRect);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener('resize', syncRect);
+    };
+  }, [isNativeBrowserEngine, nativeViewportVisible, findInPage, blockedCleartextUrl]);
+
+  useEffect(() => {
+    if (!isNativeBrowserEngine) return;
+    return () => {
+      getSalviaNative()?.setBrowserViewport?.(false, 0, 0, 0, 0);
+    };
+  }, [isNativeBrowserEngine]);
+
+  // Keep Android floating download orb synchronized on top of native Chromium WebView
+  useEffect(() => {
+    if (!isNativeBrowserEngine) return;
+    const native = getSalviaNative();
+    if (!native?.setFloatingOrbState) return;
+
+    const mediaCount = currentTabCandidates.length;
+    const highlighted = currentMainCandidate !== null || mediaCount > 0;
+    const orbVisible = settings.isFloatingButtonAlwaysVisible || mediaCount > 0;
+    const sizeDp = Math.min(76, Math.max(46, settings.floatingButtonSize || 54));
+    const desc = highlighted
+      ? t('media_floating_ready', { count: mediaCount })
+      : t('media_floating_idle');
+
+    native.setFloatingOrbState(
+      nativeViewportVisible && orbVisible,
+      highlighted,
+      mediaCount,
+      sizeDp,
+      settings.floatingButtonX || 0,
+      settings.floatingButtonY || 0,
+      desc
+    );
+
+    window.__salviaNativeFabTap = () => downloadMainMedia();
+    window.__salviaNativeFabLongPress = () => openMediaTray();
+    window.__salviaNativeFabMove = (xCss, yCss) => {
+      updateSettings({ floatingButtonX: xCss, floatingButtonY: yCss });
+    };
+    return () => {
+      delete window.__salviaNativeFabTap;
+      delete window.__salviaNativeFabLongPress;
+      delete window.__salviaNativeFabMove;
+    };
+  }, [
+    isNativeBrowserEngine,
+    nativeViewportVisible,
+    currentTabCandidates.length,
+    currentMainCandidate,
+    settings.isFloatingButtonAlwaysVisible,
+    settings.floatingButtonSize,
+    settings.floatingButtonX,
+    settings.floatingButtonY,
+    downloadMainMedia,
+    openMediaTray,
+    updateSettings,
+    t,
+  ]);
 
   const BackIcon = isRtl ? ArrowRight : ArrowLeft;
   const ForwardIcon = isRtl ? ArrowLeft : ArrowRight;
@@ -221,10 +339,6 @@ export const BrowserScreen: React.FC = () => {
     await navigator.clipboard?.writeText(currentTab.url);
     showToast(t('link_copied'));
   };
-
-  const showcasePage = page?.isDemoShowcase
-    ? BUILTIN_SHOWCASE_PAGES.find((p) => p.url === page.url) || BUILTIN_SHOWCASE_PAGES[0]
-    : null;
 
   return (
     <div className="flex h-screen overflow-hidden bg-[#000000] text-[#F4F2FF]">
@@ -762,7 +876,7 @@ export const BrowserScreen: React.FC = () => {
             </div>
           )}
 
-          <FloatingDownloadButton containerRef={viewportRef} />
+          {!nativeViewportVisible ? <FloatingDownloadButton containerRef={viewportRef} /> : null}
         </div>
 
         {/* Mobile Thumb-Zone Bottom Dock (<= 56px tall, within 15% mobile cap) */}
@@ -826,7 +940,7 @@ export const BrowserScreen: React.FC = () => {
         <div className="fixed inset-0 z-50" onClick={() => setMenuOpen(false)}>
           <div
             onClick={(e) => e.stopPropagation()}
-            className="absolute right-3 bottom-16 w-72 overflow-hidden rounded-2xl border border-[#312556] bg-[#100C20] py-1.5 shadow-2xl md:top-24 md:right-4 md:bottom-auto"
+            className="animate-salvia-menu-in absolute right-3 bottom-16 w-72 overflow-hidden rounded-2xl border border-[#312556] bg-[#100C20] py-1.5 shadow-2xl md:top-24 md:right-4 md:bottom-auto"
           >
             {/* Quick Zoom Controls */}
             <div className="flex items-center justify-between border-b border-[#312556]/50 px-4 py-2">

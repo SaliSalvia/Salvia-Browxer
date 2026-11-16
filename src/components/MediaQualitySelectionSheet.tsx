@@ -37,6 +37,15 @@ export const MediaQualitySelectionSheet: React.FC = () => {
     }
   }, [qualitySheet]);
 
+  useEffect(() => {
+    if (!qualitySheet) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') closeQualitySheet();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [qualitySheet, closeQualitySheet]);
+
   if (!qualitySheet) return null;
 
   const { mediaInfo, isResolving, unsupported, canRecord } = qualitySheet;
@@ -76,7 +85,7 @@ export const MediaQualitySelectionSheet: React.FC = () => {
         aria-modal="true"
         aria-label={t('select_quality')}
         onClick={(e) => e.stopPropagation()}
-        className="flex max-h-[88vh] w-full max-w-xl flex-col overflow-hidden rounded-t-3xl border border-[#312556] bg-[#100C20] sm:rounded-3xl shadow-2xl"
+        className="animate-salvia-sheet-in flex max-h-[88vh] w-full max-w-xl flex-col overflow-hidden rounded-t-3xl border border-[#312556] bg-[#100C20] sm:rounded-3xl shadow-2xl"
       >
         <div className="mx-auto mt-2.5 h-1 w-10 rounded-full bg-[#312556] sm:hidden" />
 

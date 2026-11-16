@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { classifyPastedLink, pastedMediaCandidate } from './pastedLink';
 import { resolveAddressBarInput, extractFirstSharedUrl } from './addressBarResolver';
 import { isBlockedAdHost, hostOfUrl } from './adBlockRules';
-import { formatBitrateKbps, parseHlsPlaylist, sanitizeFilename, scanHtmlForMedia } from './mediaResolver';
+import { formatBitrateKbps, parseDashManifest, parseHlsPlaylist, sanitizeFilename, scanHtmlForMedia } from './mediaResolver';
+import { capMediaCandidates, pruneTabPagesCache } from './memoryCachePolicy';
 import { selectMainCandidate, rankAndClassifyCandidates } from './mainContentSelector';
 import { snapFloatingPosition } from './floatingSnap';
 import { unsupportedReasonFor } from './mediaOfferability';
@@ -214,4 +215,72 @@ test('scanHtmlForMedia extracts expanded player JSON keys while rejecting YouTub
   assert.ok(results.some((c) => c.mediaUrl === 'https://cdn.example.net/hls/master.m3u8'));
   assert.ok(results.some((c) => c.mediaUrl === 'https://cdn.example.net/video/hd_clip.mp4'));
   assert.equal(results.some((c) => c.mediaUrl.includes('youtube.com')), false);
+});
+
+test('parseDashManifest parses SegmentTemplate video and audio tracks and rejects DRM or live', () => {
+  const vodMpd = `
+    <MPD type="static" mediaPresentationDuration="PT12S">
+      <Period>
+        <AdaptationSet mimeType="video/mp4">
+          <SegmentTemplate initialization="init-$RepresentationID$.m4s" media="seg-$RepresentationID$-$Number$.m4s" startNumber="1" timescale="1000" duration="4000"/>
+          <Representation id="v720" bandwidth="2200000" width="1280" height="720"/>
+          <Representation id="v1080" bandwidth="4800000" width="1920" height="1080"/>
+        </AdaptationSet>
+        <AdaptationSet mimeType="audio/mp4">
+          <SegmentTemplate initialization="init-$RepresentationID$.m4s" media="seg-$RepresentationID$-$Number$.m4s" startNumber="1" timescale="1000" duration="4000"/>
+          <Representation id="a128" bandwidth="128000"/>
+        </AdaptationSet>
+      </Period>
+    </MPD>
+  `;
+  const parsed = parseDashManifest(vodMpd, 'https://cdn.example.com/dash/stream.mpd');
+  assert.equal(parsed.unsupported, null);
+  assert.equal(parsed.formats.length, 2);
+  assert.equal(parsed.formats[0].height, 1080);
+  assert.ok(parsed.formats[0].url.includes('stream.mpd#salvia_rep=v1080'));
+  assert.equal(parsed.audioFormats?.length, 1);
+
+  const drmMpd = `<MPD><Period><AdaptationSet mimeType="video/mp4"><ContentProtection schemeIdUri="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"/><Representation id="v1" bandwidth="1000000"/></AdaptationSet></Period></MPD>`;
+  assert.equal(parseDashManifest(drmMpd, 'https://cdn.example.com/drm.mpd').unsupported, 'DRM');
+
+  const liveMpd = `<MPD type="dynamic"><Period><AdaptationSet mimeType="video/mp4"><Representation id="v1" bandwidth="1000000"/></AdaptationSet></Period></MPD>`;
+  assert.equal(parseDashManifest(liveMpd, 'https://cdn.example.com/live.mpd').unsupported, 'LIVE');
+});
+
+test('pruneTabPagesCache keeps active tab HTML and strips older inactive tabs to save RAM', () => {
+  const mk = (url: string, html: string | null) => ({
+    url,
+    title: url,
+    html,
+    isLoading: false,
+    progress: 100,
+    error: null,
+    isDemoShowcase: false,
+  });
+  const pruned = pruneTabPagesCache(
+    {
+      t1: mk('https://a.test', '<html>old1</html>'),
+      t2: mk('https://b.test', '<html>old2</html>'),
+      t3: mk('https://c.test', '<html>recent</html>'),
+    },
+    't1',
+    2
+  );
+  assert.equal(pruned.t1.html, '<html>old1</html>');
+  assert.equal(pruned.t3.html, '<html>recent</html>');
+  assert.equal(pruned.t2.html, null);
+  assert.equal(pruned.t2.url, 'https://b.test');
+
+  const many = Array.from({ length: 80 }, (_, idx) => ({
+    id: `c-${idx}`,
+    pageUrl: 'https://site.test',
+    mediaUrl: `https://cdn.test/v${idx}.mp4`,
+    extension: 'mp4',
+    mimeType: 'video/mp4',
+    source: 'DOM' as const,
+    confidence: idx === 79 ? 0.99 : 0.4 + idx * 0.005,
+  }));
+  const capped = capMediaCandidates(many, 60);
+  assert.equal(capped.length, 60);
+  assert.equal(capped[0].id, 'c-79');
 });

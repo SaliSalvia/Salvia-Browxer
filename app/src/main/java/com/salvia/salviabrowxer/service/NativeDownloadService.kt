@@ -16,6 +16,8 @@ import com.salvia.salviabrowxer.R
 import com.salvia.salviabrowxer.SalviaApplication
 import com.salvia.salviabrowxer.core.NativeProxyClient
 import com.salvia.salviabrowxer.core.RangeChunkPlanner
+import com.salvia.salviabrowxer.media.DashManifestParser
+import com.salvia.salviabrowxer.media.DashSegmentPlan
 import com.salvia.salviabrowxer.media.HlsKeyParser
 import com.salvia.salviabrowxer.media.NativeMediaMuxer
 import com.salvia.salviabrowxer.storage.MediaPublisher
@@ -121,9 +123,22 @@ class NativeDownloadService : Service() {
         super.onDestroy()
     }
 
+    private fun cleanHttpUrl(rawUrl: String): String {
+        val hashIdx = rawUrl.indexOf('#')
+        return if (hashIdx >= 0) rawUrl.substring(0, hashIdx) else rawUrl
+    }
+
+    private fun isDashSource(url: String, mimeType: String): Boolean {
+        val clean = cleanHttpUrl(url).lowercase()
+        val mimeLow = mimeType.lowercase()
+        return mimeLow.contains("dash+xml") ||
+            clean.contains(".mpd?") ||
+            clean.endsWith(".mpd")
+    }
+
     private fun newRequestBuilder(url: String, referer: String?): Request.Builder {
         val builder = Request.Builder()
-            .url(url)
+            .url(cleanHttpUrl(url))
             .header("User-Agent", USER_AGENT)
         if (!referer.isNullOrBlank()) {
             builder.header("Referer", referer)
@@ -191,8 +206,12 @@ class NativeDownloadService : Service() {
         }
 
         try {
+            val isDash = !isHls && isDashSource(url, mimeType)
             val outMime = if (isHls) {
                 downloadHls(job, url, audioTrackUrl, outFile, referer) { dl, est -> reportProgress(dl, est) }
+                "video/mp4"
+            } else if (isDash) {
+                downloadDash(job, url, outFile, referer) { dl, est -> reportProgress(dl, est) }
                 "video/mp4"
             } else if (!audioTrackUrl.isNullOrBlank()) {
                 val muxDir = File(cacheDir, "mux_$safeStorageId").apply { mkdirs() }
@@ -201,7 +220,14 @@ class NativeDownloadService : Service() {
                     val audioTmp = File(muxDir, "audio.bin")
                     downloadDirect(job, url, videoTmp, partsDir, connections, referer) { dl, total -> reportProgress(dl, total) }
                     if (!job.paused.get() && !job.cancelled.get()) {
-                        downloadSingleStream(job, audioTrackUrl, audioTmp, referer)
+                        when {
+                            audioTrackUrl.contains(".m3u8", ignoreCase = true) ->
+                                downloadHlsRaw(job, audioTrackUrl, audioTmp, muxDir, referer)
+                            isDashSource(audioTrackUrl, "") ->
+                                downloadDashTrackOnly(job, audioTrackUrl, audioTmp, muxDir, referer, preferAudio = true)
+                            else ->
+                                downloadSingleStream(job, audioTrackUrl, audioTmp, referer)
+                        }
                     }
                     if (!job.paused.get() && !job.cancelled.get()) {
                         val muxed = NativeMediaMuxer.muxVideoAndAudio(videoTmp, audioTmp, outFile)
@@ -461,6 +487,191 @@ class NativeDownloadService : Service() {
         return detectedMime
     }
 
+    /**
+     * Downloads DASH (.mpd) manifests with SegmentTemplate / SegmentTimeline / SegmentList / BaseURL,
+     * streams video & audio segments in bounded batches (minimal RAM & temp disk), and muxes to MP4.
+     */
+    private fun downloadDash(
+        job: JobState,
+        mpdUrl: String,
+        outFile: File,
+        referer: String?,
+        onProgress: (Long, Long?) -> Unit
+    ) {
+        val desiredRepId = mpdUrl.substringAfter("#salvia_rep=", "").takeIf { it.isNotBlank() }
+        val manifestText = fetchText(job, cleanHttpUrl(mpdUrl), referer)
+        val parsed = DashManifestParser.parse(manifestText, mpdUrl)
+        if (parsed.isDrmProtected) {
+            throw IllegalStateException("DRM-protected DASH stream cannot be downloaded")
+        }
+        if (parsed.isDynamicLive) {
+            throw IllegalStateException("Live DASH streams are not supported")
+        }
+
+        val videoTrack = (desiredRepId?.let { id -> parsed.videoTracks.firstOrNull { it.id == id } }
+            ?: parsed.videoTracks.firstOrNull())
+        val audioTrack = parsed.audioTracks.firstOrNull()
+
+        if (videoTrack == null && audioTrack == null) {
+            throw IllegalStateException("No downloadable DASH tracks found")
+        }
+
+        val tempDir = File(cacheDir, "dash_${job.id.replace(Regex("[^a-zA-Z0-9._-]"), "_")}").apply { mkdirs() }
+        try {
+            val totalDownloaded = AtomicLong(0L)
+            if (videoTrack != null) {
+                val videoFile = File(tempDir, "video_dash.bin")
+                downloadDashPlan(job, videoTrack.plan, videoFile, tempDir, "v", referer) { segBytes, totalSegs, doneSegs ->
+                    val dl = totalDownloaded.addAndGet(segBytes)
+                    val estTotal = if (doneSegs > 0) ((dl.toDouble() / doneSegs) * totalSegs).toLong() else null
+                    onProgress(dl, estTotal)
+                }
+                if (job.paused.get() || job.cancelled.get()) return
+
+                if (audioTrack != null) {
+                    val audioFile = File(tempDir, "audio_dash.bin")
+                    downloadDashPlan(job, audioTrack.plan, audioFile, tempDir, "a", referer) { segBytes, _, _ ->
+                        totalDownloaded.addAndGet(segBytes)
+                    }
+                    if (job.paused.get() || job.cancelled.get()) return
+
+                    val muxed = NativeMediaMuxer.muxVideoAndAudio(videoFile, audioFile, outFile)
+                    if (!muxed) {
+                        val remuxed = NativeMediaMuxer.remuxToMp4(videoFile, outFile)
+                        if (!remuxed) videoFile.copyTo(outFile, overwrite = true)
+                    }
+                    audioFile.delete()
+                } else {
+                    val remuxed = NativeMediaMuxer.remuxToMp4(videoFile, outFile)
+                    if (!remuxed) {
+                        videoFile.copyTo(outFile, overwrite = true)
+                    }
+                }
+                videoFile.delete()
+            } else if (audioTrack != null) {
+                val audioFile = File(tempDir, "audio_dash.bin")
+                downloadDashPlan(job, audioTrack.plan, audioFile, tempDir, "a", referer) { segBytes, totalSegs, doneSegs ->
+                    val dl = totalDownloaded.addAndGet(segBytes)
+                    val estTotal = if (doneSegs > 0) ((dl.toDouble() / doneSegs) * totalSegs).toLong() else null
+                    onProgress(dl, estTotal)
+                }
+                if (job.paused.get() || job.cancelled.get()) return
+                val remuxed = NativeMediaMuxer.remuxToMp4(audioFile, outFile)
+                if (!remuxed) {
+                    audioFile.copyTo(outFile, overwrite = true)
+                }
+                audioFile.delete()
+            }
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    private fun downloadDashTrackOnly(
+        job: JobState,
+        mpdUrl: String,
+        outFile: File,
+        tempDir: File,
+        referer: String?,
+        preferAudio: Boolean
+    ) {
+        val manifestText = fetchText(job, cleanHttpUrl(mpdUrl), referer)
+        val parsed = DashManifestParser.parse(manifestText, mpdUrl)
+        val track = if (preferAudio) {
+            parsed.audioTracks.firstOrNull() ?: parsed.videoTracks.firstOrNull()
+        } else {
+            parsed.videoTracks.firstOrNull() ?: parsed.audioTracks.firstOrNull()
+        } ?: return
+        downloadDashPlan(job, track.plan, outFile, tempDir, if (preferAudio) "a" else "v", referer) { _, _, _ -> }
+    }
+
+    private fun downloadDashPlan(
+        job: JobState,
+        plan: DashSegmentPlan,
+        outFile: File,
+        tempDir: File,
+        prefix: String,
+        referer: String?,
+        onSegmentDelta: (Long, Int, Int) -> Unit
+    ) {
+        val allUrls = buildList {
+            plan.initUrl?.let { add(it) }
+            addAll(plan.segmentUrls)
+        }
+        if (allUrls.isEmpty()) throw IllegalStateException("Empty DASH segment plan")
+
+        val totalCount = allUrls.size
+        val completedCount = AtomicInteger(0)
+        val batchSize = 12
+
+        FileOutputStream(outFile, false).use { mergedOut ->
+            var offset = 0
+            while (offset < totalCount && !job.paused.get() && !job.cancelled.get()) {
+                val end = minOf(offset + batchSize, totalCount)
+                val countInBatch = end - offset
+                val batchFiles = Array<File?>(countInBatch) { null }
+                val failure = AtomicReference<Throwable?>(null)
+                val nextLocal = AtomicInteger(0)
+                val workers = minOf(4, countInBatch)
+                val latch = CountDownLatch(workers)
+
+                repeat(workers) {
+                    pool.execute {
+                        try {
+                            val buf = ByteArray(32 * 1024)
+                            while (!job.paused.get() && !job.cancelled.get() && failure.get() == null) {
+                                val localIdx = nextLocal.getAndIncrement()
+                                if (localIdx >= countInBatch) break
+                                val globalIdx = offset + localIdx
+                                val segUrl = allUrls[globalIdx]
+                                val segFile = File(tempDir, "${prefix}_dash_$globalIdx.seg")
+                                val call = NativeProxyClient.httpClient.newCall(
+                                    newRequestBuilder(segUrl, referer).build()
+                                )
+                                job.activeCalls.add(call)
+                                var writtenBytes = 0L
+                                try {
+                                    call.execute().use { res ->
+                                        if (!res.isSuccessful) throw IllegalStateException("DASH segment HTTP ${res.code}")
+                                        val input = res.body?.byteStream() ?: throw IllegalStateException("Empty DASH segment")
+                                        segFile.outputStream().use { segOut ->
+                                            while (!job.paused.get() && !job.cancelled.get()) {
+                                                val n = input.read(buf)
+                                                if (n < 0) break
+                                                segOut.write(buf, 0, n)
+                                                writtenBytes += n
+                                            }
+                                        }
+                                    }
+                                } finally {
+                                    job.activeCalls.remove(call)
+                                }
+                                batchFiles[localIdx] = segFile
+                                val doneNow = completedCount.incrementAndGet()
+                                onSegmentDelta(writtenBytes, totalCount, doneNow)
+                            }
+                        } catch (t: Throwable) {
+                            failure.compareAndSet(null, t)
+                        } finally {
+                            latch.countDown()
+                        }
+                    }
+                }
+                latch.await()
+                failure.get()?.let { throw it }
+                if (job.paused.get() || job.cancelled.get()) return
+
+                for (i in 0 until countInBatch) {
+                    val segFile = batchFiles[i] ?: continue
+                    segFile.inputStream().use { it.copyTo(mergedOut, 32 * 1024) }
+                    segFile.delete()
+                    batchFiles[i] = null
+                }
+                offset = end
+            }
+        }
+    }
+
     private fun downloadHls(
         job: JobState,
         playlistUrl: String,
@@ -484,77 +695,89 @@ class NativeDownloadService : Service() {
         val tempDir = File(cacheDir, "hls_${job.id.replace(Regex("[^a-zA-Z0-9._-]"), "_")}").apply { mkdirs() }
 
         try {
-            val segFiles = Array<File?>(entries.size) { null }
-            val nextIndex = AtomicInteger(0)
+            val rawMergedTs = File(tempDir, "merged_video.ts")
             val completedSegments = AtomicInteger(0)
             val downloaded = AtomicLong(0L)
-            val failure = AtomicReference<Throwable?>(null)
-            val workers = minOf(4, entries.size)
-            val latch = CountDownLatch(workers)
+            val batchSize = 16
 
-            repeat(workers) {
-                pool.execute {
-                    try {
-                        while (!job.paused.get() && !job.cancelled.get() && failure.get() == null) {
-                            val idx = nextIndex.getAndIncrement()
-                            if (idx >= entries.size) break
-                            val entry = entries[idx]
-                            val segReqBuilder = newRequestBuilder(entry.url, referer)
-                            if (entry.byteRangeOffset != null && entry.byteRangeLength != null && entry.byteRangeLength > 0L) {
-                                val endByte = entry.byteRangeOffset + entry.byteRangeLength - 1L
-                                segReqBuilder.header("Range", "bytes=${entry.byteRangeOffset}-$endByte")
-                            }
-                            val segCall = NativeProxyClient.httpClient.newCall(segReqBuilder.build())
-                            job.activeCalls.add(segCall)
-                            val rawBytes = try {
-                                segCall.execute().use { res ->
-                                    if (!res.isSuccessful) throw IllegalStateException("Segment HTTP ${res.code}")
-                                    res.body?.bytes() ?: throw IllegalStateException("Empty segment")
+            // Rolling bounded batches keep mobile RAM and temp disk usage minimal even on long HD videos
+            FileOutputStream(rawMergedTs, false).use { mergedOut ->
+                var offset = 0
+                while (offset < entries.size && !job.paused.get() && !job.cancelled.get()) {
+                    val end = minOf(offset + batchSize, entries.size)
+                    val batchCount = end - offset
+                    val segFiles = Array<File?>(batchCount) { null }
+                    val nextLocal = AtomicInteger(0)
+                    val failure = AtomicReference<Throwable?>(null)
+                    val workers = minOf(4, batchCount)
+                    val latch = CountDownLatch(workers)
+
+                    repeat(workers) {
+                        pool.execute {
+                            try {
+                                while (!job.paused.get() && !job.cancelled.get() && failure.get() == null) {
+                                    val localIdx = nextLocal.getAndIncrement()
+                                    if (localIdx >= batchCount) break
+                                    val globalIdx = offset + localIdx
+                                    val entry = entries[globalIdx]
+                                    val segReqBuilder = newRequestBuilder(entry.url, referer)
+                                    if (entry.byteRangeOffset != null && entry.byteRangeLength != null && entry.byteRangeLength > 0L) {
+                                        val endByte = entry.byteRangeOffset + entry.byteRangeLength - 1L
+                                        segReqBuilder.header("Range", "bytes=${entry.byteRangeOffset}-$endByte")
+                                    }
+                                    val segCall = NativeProxyClient.httpClient.newCall(segReqBuilder.build())
+                                    job.activeCalls.add(segCall)
+                                    val rawBytes = try {
+                                        segCall.execute().use { res ->
+                                            if (!res.isSuccessful) throw IllegalStateException("Segment HTTP ${res.code}")
+                                            res.body?.bytes() ?: throw IllegalStateException("Empty segment")
+                                        }
+                                    } finally {
+                                        job.activeCalls.remove(segCall)
+                                    }
+
+                                    val finalBytes = if (entry.keySpec != null && entry.keySpec.method == "AES-128") {
+                                        val keyUri = entry.keySpec.keyUri
+                                            ?: throw IllegalStateException("Missing AES-128 key URI")
+                                        val keyBytes = keyCache.getOrPut(keyUri) { fetchKeyBytes(job, keyUri, referer) }
+                                        val iv = entry.keySpec.explicitIv ?: HlsKeyParser.sequenceIv(entry.sequenceNumber)
+                                        HlsKeyParser.decryptAes128Cbc(rawBytes, keyBytes, iv)
+                                    } else {
+                                        rawBytes
+                                    }
+
+                                    val segFile = File(tempDir, "seg_$globalIdx.ts")
+                                    segFile.writeBytes(finalBytes)
+                                    segFiles[localIdx] = segFile
+
+                                    val nowDl = downloaded.addAndGet(finalBytes.size.toLong())
+                                    val doneCount = completedSegments.incrementAndGet()
+                                    val estTotal = ((nowDl.toDouble() / doneCount) * entries.size).toLong()
+                                    onProgress(nowDl, estTotal)
                                 }
+                            } catch (t: Throwable) {
+                                failure.compareAndSet(null, t)
                             } finally {
-                                job.activeCalls.remove(segCall)
+                                latch.countDown()
                             }
-
-                            val finalBytes = if (entry.keySpec != null && entry.keySpec.method == "AES-128") {
-                                val keyUri = entry.keySpec.keyUri
-                                    ?: throw IllegalStateException("Missing AES-128 key URI")
-                                val keyBytes = keyCache.getOrPut(keyUri) { fetchKeyBytes(job, keyUri, referer) }
-                                val iv = entry.keySpec.explicitIv ?: HlsKeyParser.sequenceIv(entry.sequenceNumber)
-                                HlsKeyParser.decryptAes128Cbc(rawBytes, keyBytes, iv)
-                            } else {
-                                rawBytes
-                            }
-
-                            val segFile = File(tempDir, "seg_$idx.ts")
-                            segFile.writeBytes(finalBytes)
-                            segFiles[idx] = segFile
-
-                            val nowDl = downloaded.addAndGet(finalBytes.size.toLong())
-                            val doneCount = completedSegments.incrementAndGet()
-                            val estTotal = ((nowDl.toDouble() / doneCount) * entries.size).toLong()
-                            onProgress(nowDl, estTotal)
                         }
-                    } catch (t: Throwable) {
-                        failure.compareAndSet(null, t)
-                    } finally {
-                        latch.countDown()
                     }
+                    latch.await()
+                    failure.get()?.let { throw it }
+
+                    if (job.paused.get() || job.cancelled.get()) return
+
+                    for (i in 0 until batchCount) {
+                        val seg = segFiles[i] ?: continue
+                        seg.inputStream().use { it.copyTo(mergedOut, 32 * 1024) }
+                        seg.delete()
+                        segFiles[i] = null
+                    }
+                    offset = end
                 }
             }
-            latch.await()
-            failure.get()?.let { throw it }
 
             if (job.paused.get() || job.cancelled.get()) return
-
-            val rawMergedTs = File(tempDir, "merged_video.ts")
-            rawMergedTs.outputStream().use { out ->
-                for (i in segFiles.indices) {
-                    val seg = segFiles[i] ?: continue
-                    seg.inputStream().use { it.copyTo(out, 32 * 1024) }
-                    seg.delete()
-                    segFiles[i] = null
-                }
-            }
 
             if (!audioTrackUrl.isNullOrBlank()) {
                 val audioFile = File(tempDir, "audio_track.bin")

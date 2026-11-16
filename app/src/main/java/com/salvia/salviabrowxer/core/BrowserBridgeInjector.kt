@@ -37,42 +37,39 @@ object BrowserBridgeInjector {
             .replace("&gt;", ">", ignoreCase = true)
     }
 
-    fun inject(rawHtml: String, finalUrl: String, adBlock: Boolean): InjectedResult {
-        val title = titleRegex.find(rawHtml)?.groupValues?.getOrNull(1)
-            ?.let { decodeBasicEntities(it).trim() }
-            ?.takeIf { it.isNotEmpty() }
-        var blockedCount = 0
-        var cleaned = rawHtml
-            .replace(cspMetaRegex, "")
-            .replace(xfoMetaRegex, "")
-
-        if (adBlock) {
-            cleaned = scriptSrcRegex.replace(cleaned) { match ->
-                val src = match.groupValues.getOrNull(1).orEmpty()
-                val resolved = try {
-                    java.net.URI(finalUrl).resolve(src).toString()
-                } catch (_: Exception) {
-                    src
-                }
-                if (AdBlockHostRules.isBlockedUrl(resolved)) {
-                    blockedCount++
-                    "<!-- blocked by SalviaBrowxer -->"
-                } else {
-                    match.value
-                }
-            }
-        }
-
-        val escapedBase = finalUrl.replace("\"", "&quot;")
-        val baseTag = "<base href=\"$escapedBase\">"
+    /**
+     * Generates the lightweight media detection & playback hook script used both
+     * inside proxied HTML frames (iframe postMessage) AND directly inside the native
+     * Chromium browserWebView (via window.SalviaNative.reportBrowserMedia).
+     */
+    fun buildDetectorScript(finalUrl: String, isLiveWebView: Boolean): String {
         val quotedUrl = JSONObject.quote(finalUrl)
-        val bridgeScript = """
-<script>
+        val liveFlag = if (isLiveWebView) "true" else "false"
+        return """
 (function() {
+  if (window.__salviaDetectorInstalled && $liveFlag) {
+    try { window.__salviaSetPageUrl && window.__salviaSetPageUrl($quotedUrl); } catch (e) {}
+    return;
+  }
+  window.__salviaDetectorInstalled = true;
   var PAGE_URL = $quotedUrl;
+  var IS_LIVE_WEBVIEW = $liveFlag;
   var SEEN = Object.create(null);
+  window.__salviaSetPageUrl = function(u) {
+    if (u && u !== PAGE_URL) {
+      PAGE_URL = u;
+      SEEN = Object.create(null);
+    }
+    scheduleScan();
+  };
   function report(type, payload) {
-    try { window.parent.postMessage({ source: 'salvia-browser-bridge', type: type, payload: payload }, '*'); } catch (e) {}
+    try {
+      if (IS_LIVE_WEBVIEW && window.SalviaNative && typeof window.SalviaNative.reportBrowserMedia === 'function') {
+        window.SalviaNative.reportBrowserMedia(JSON.stringify({ type: type, payload: payload }));
+      } else if (window.parent && window.parent !== window) {
+        window.parent.postMessage({ source: 'salvia-browser-bridge', type: type, payload: payload }, '*');
+      }
+    } catch (e) {}
   }
   function isMediaUrl(u) {
     if (!u || typeof u !== 'string' || u.startsWith('data:') || u.startsWith('javascript:')) return false;
@@ -148,7 +145,7 @@ object BrowserBridgeInjector {
     scanTimer = setTimeout(function() {
       scanTimer = null;
       scanMedia();
-    }, 150);
+    }, 180);
   }
   function scanMedia() {
     var items = [];
@@ -238,12 +235,17 @@ object BrowserBridgeInjector {
   }
   if (window.MutationObserver) {
     var obs = new MutationObserver(function() { scheduleScan(); });
-    window.addEventListener('DOMContentLoaded', function() {
+    var attachObs = function() {
       scanMedia();
       if (document.body) obs.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'data-src', 'data-video-src', 'data-mp4', 'data-hls'] });
-    });
+    };
+    if (document.readyState === 'loading') {
+      window.addEventListener('DOMContentLoaded', attachObs);
+    } else {
+      attachObs();
+    }
   } else {
-    window.addEventListener('DOMContentLoaded', scanMedia);
+    scanMedia();
   }
   window.addEventListener('load', scanMedia);
   function handlePlaybackEvent(e) {
@@ -279,32 +281,64 @@ object BrowserBridgeInjector {
   document.addEventListener('durationchange', handlePlaybackEvent, true);
   document.addEventListener('playing', handlePlaybackEvent, true);
   document.addEventListener('play', handlePlaybackEvent, true);
-  document.addEventListener('click', function(e) {
-    var a = e.target && e.target.closest ? e.target.closest('a[href]') : null;
-    if (a && a.href && !a.href.startsWith('javascript:')) {
-      e.preventDefault();
-      report('navigate', { url: a.href });
-    }
-  }, true);
-  window.addEventListener('message', function(ev) {
-    if (!ev.data || ev.data.target !== 'salvia-iframe') return;
-    if (ev.data.type === 'find') {
-      var q = (ev.data.query || '').trim();
-      if (!q) { report('find-result', { matches: 0, active: 0 }); return; }
-      var text = document.body ? (document.body.innerText || '') : '';
-      var lower = text.toLowerCase();
-      var needle = q.toLowerCase();
-      var count = 0, idx = 0;
-      while ((idx = lower.indexOf(needle, idx)) !== -1) { count++; idx += needle.length; }
-      if (window.find && count > 0) {
-        window.find(q, false, !!ev.data.backwards, true, false, true, false);
+  if (!IS_LIVE_WEBVIEW) {
+    document.addEventListener('click', function(e) {
+      var a = e.target && e.target.closest ? e.target.closest('a[href]') : null;
+      if (a && a.href && !a.href.startsWith('javascript:')) {
+        e.preventDefault();
+        report('navigate', { url: a.href });
       }
-      report('find-result', { matches: count, active: count > 0 ? 1 : 0 });
-    }
-  });
+    }, true);
+    window.addEventListener('message', function(ev) {
+      if (!ev.data || ev.data.target !== 'salvia-iframe') return;
+      if (ev.data.type === 'find') {
+        var q = (ev.data.query || '').trim();
+        if (!q) { report('find-result', { matches: 0, active: 0 }); return; }
+        var text = document.body ? (document.body.innerText || '') : '';
+        var lower = text.toLowerCase();
+        var needle = q.toLowerCase();
+        var count = 0, idx = 0;
+        while ((idx = lower.indexOf(needle, idx)) !== -1) { count++; idx += needle.length; }
+        if (window.find && count > 0) {
+          window.find(q, false, !!ev.data.backwards, true, false, true, false);
+        }
+        report('find-result', { matches: count, active: count > 0 ? 1 : 0 });
+      }
+    });
+  }
 })();
-</script>
-""".trimIndent()
+        """.trimIndent()
+    }
+
+    fun inject(rawHtml: String, finalUrl: String, adBlock: Boolean): InjectedResult {
+        val title = titleRegex.find(rawHtml)?.groupValues?.getOrNull(1)
+            ?.let { decodeBasicEntities(it).trim() }
+            ?.takeIf { it.isNotEmpty() }
+        var blockedCount = 0
+        var cleaned = rawHtml
+            .replace(cspMetaRegex, "")
+            .replace(xfoMetaRegex, "")
+
+        if (adBlock) {
+            cleaned = scriptSrcRegex.replace(cleaned) { match ->
+                val src = match.groupValues.getOrNull(1).orEmpty()
+                val resolved = try {
+                    java.net.URI(finalUrl).resolve(src).toString()
+                } catch (_: Exception) {
+                    src
+                }
+                if (AdBlockHostRules.isBlockedUrl(resolved)) {
+                    blockedCount++
+                    "<!-- blocked by SalviaBrowxer -->"
+                } else {
+                    match.value
+                }
+            }
+        }
+
+        val escapedBase = finalUrl.replace("\"", "&quot;")
+        val baseTag = "<base href=\"$escapedBase\">"
+        val bridgeScript = "<script>\n${buildDetectorScript(finalUrl, isLiveWebView = false)}\n</script>"
 
         cleaned = if (headOpenRegex.containsMatchIn(cleaned)) {
             headOpenRegex.replaceFirst(cleaned) { match ->

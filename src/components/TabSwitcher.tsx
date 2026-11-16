@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect } from 'react';
 import { Copy, Lock, Plus, X } from 'lucide-react';
 import { hostOfUrl } from '../core/adBlockRules';
 import { useApp } from '../store/AppContext';
@@ -17,6 +17,15 @@ export const TabSwitcher: React.FC = () => {
     duplicateTab,
     t,
   } = useApp();
+
+  useEffect(() => {
+    if (!isTabSwitcherVisible) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') closeTabSwitcher();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isTabSwitcherVisible, closeTabSwitcher]);
 
   if (!isTabSwitcherVisible) return null;
 
@@ -102,7 +111,7 @@ export const TabSwitcher: React.FC = () => {
 
   return (
     <div
-      className="fixed inset-0 z-50 flex flex-col bg-[#000000]/95 backdrop-blur-md"
+      className="animate-salvia-sheet-in fixed inset-0 z-50 flex flex-col bg-[#000000]/95 backdrop-blur-md"
       role="dialog"
       aria-modal="true"
       aria-label={t('tabs')}

@@ -3,6 +3,7 @@ package com.salvia.salviabrowxer
 import android.app.Application
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.content.ComponentCallbacks2
 import android.os.Build
 import com.salvia.salviabrowxer.core.NativeProxyClient
 
@@ -19,6 +20,18 @@ class SalviaApplication : Application() {
             name = "salvia-warmup"
             isDaemon = true
             start()
+        }
+    }
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW ||
+            level == ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN
+        ) {
+            try {
+                NativeProxyClient.httpClient.connectionPool.evictAll()
+            } catch (_: Exception) {
+            }
         }
     }
 

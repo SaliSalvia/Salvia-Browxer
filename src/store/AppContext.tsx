@@ -47,7 +47,10 @@ import {
   getSalviaNative,
   isNativeAndroid,
   registerNativeBackHandler,
+  registerNativeBrowserListener,
+  supportsNativeBrowser,
 } from '../core/nativeBridge';
+import { capMediaCandidates, pruneTabPagesCache } from '../core/memoryCachePolicy';
 import { getTranslator, resolveActiveLocale, type TranslationMap } from '../i18n/translations';
 import type {
   AddressSuggestion,
@@ -160,6 +163,15 @@ interface AppContextValue {
   goForwardCurrentTab: () => void;
   goHomeInCurrentTab: () => void;
 
+  findInPage: { query: string; matches: number; activeMatch: number } | null;
+  openFindInPage: () => void;
+  closeFindInPage: () => void;
+  updateFindQuery: (query: string) => void;
+  setFindResult: (matches: number, activeMatch: number) => void;
+
+  isNativeBrowserEngine: boolean;
+  nativeNavCaps: Record<string, { canGoBack: boolean; canGoForward: boolean }>;
+
   blockedCleartextUrl: string | null;
   allowCleartextAndRetry: () => void;
   dismissCleartextBlock: () => void;
@@ -225,11 +237,7 @@ interface AppContextValue {
   saveLockedFolderPassword: (password: string) => Promise<boolean>;
   removeLockedFolderPasswordAction: () => void;
 
-  findInPage: { query: string; matches: number; activeMatch: number } | null;
-  openFindInPage: () => void;
-  closeFindInPage: () => void;
-  updateFindQuery: (query: string) => void;
-  setFindResult: (matches: number, activeMatch: number) => void;
+  // duplicate findInPage removed from original position — already declared above
 
   reportDetectedMediaFromBridge: (
     tabId: string,
@@ -412,6 +420,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   tabsRef.current = tabs;
   const tabAbortRef = useRef<Map<string, AbortController>>(new Map());
 
+  const currentTabIdRef = useRef(currentTabId);
+  currentTabIdRef.current = currentTabId;
+  const isNativeBrowserEngine = useMemo(() => supportsNativeBrowser(), []);
+  const [nativeNavCaps, setNativeNavCaps] = useState<
+    Record<string, { canGoBack: boolean; canGoForward: boolean }>
+  >({});
+
   const [tabPages, setTabPages] = useState<Record<string, TabPageRenderState>>({});
   const [tabMedia, setTabMedia] = useState<Record<string, MediaCandidate[]>>({});
   const [tabVisibleMedia, setTabVisibleMedia] = useState<Record<string, string | null>>({});
@@ -495,7 +510,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           });
         }
       }
-      return { ...prev, [tabId]: Array.from(byUrl.values()) };
+      return { ...prev, [tabId]: capMediaCandidates(Array.from(byUrl.values()), 60) };
     });
   }, []);
 
@@ -604,6 +619,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const host = hostOfUrl(url) || '';
       const adBlockActive = settings.isAdBlockEnabled && !settings.adBlockDisabledSites.includes(host);
 
+      // Android APK native Chromium WebView handles real sites directly with zero HTML heap bloat
+      const native = getSalviaNative();
+      if (isNativeBrowserEngine && native?.nativeLoadUrl) {
+        tabAbortRef.current.delete(tabId);
+        native.nativeLoadUrl(tabId, url, settings.isDesktopSite, settings.isJavaScriptEnabled, adBlockActive);
+        return;
+      }
+
       try {
         const res = await fetch(
           apiUrl(`/api/browse?url=${encodeURIComponent(url)}&desktop=${settings.isDesktopSite ? '1' : '0'}&adblock=${adBlockActive ? '1' : '0'}`),
@@ -691,18 +714,24 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           });
         }
 
-        setTabPages((prev) => ({
-          ...prev,
-          [tabId]: {
-            url: finalUrl,
-            title: pageTitle,
-            html: data.html ?? null,
-            isLoading: false,
-            progress: 100,
-            error: null,
-            isDemoShowcase: false,
-          },
-        }));
+        setTabPages((prev) =>
+          pruneTabPagesCache(
+            {
+              ...prev,
+              [tabId]: {
+                url: finalUrl,
+                title: pageTitle,
+                html: data.html ?? null,
+                isLoading: false,
+                progress: 100,
+                error: null,
+                isDemoShowcase: false,
+              },
+            },
+            currentTabIdRef.current,
+            2
+          )
+        );
 
         setTabs((prev) =>
           prev.map((tab) => (tab.id === tabId ? { ...tab, url: finalUrl, title: pageTitle } : tab))
@@ -736,7 +765,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         }
       }
     },
-    [settings.isCleartextAllowed, settings.isDesktopSite, settings.isAdBlockEnabled, settings.adBlockDisabledSites, t, logEvent, mergeTabCandidates]
+    [
+      settings.isCleartextAllowed,
+      settings.isDesktopSite,
+      settings.isJavaScriptEnabled,
+      settings.isAdBlockEnabled,
+      settings.adBlockDisabledSites,
+      isNativeBrowserEngine,
+      t,
+      logEvent,
+      mergeTabCandidates,
+    ]
   );
 
   const navigateCurrentTab = useCallback(
@@ -853,40 +892,63 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   );
 
   const reloadCurrentTab = useCallback(() => {
-    if (currentTab?.url) {
-      loadUrlIntoTab(currentTab.id, currentTab.url, false);
+    if (!currentTab?.url) return;
+    const showcase = BUILTIN_SHOWCASE_PAGES.some((p) => p.url === currentTab.url);
+    const native = getSalviaNative();
+    if (isNativeBrowserEngine && !showcase && native?.nativeReload) {
+      native.nativeReload();
+      return;
     }
-  }, [currentTab, loadUrlIntoTab]);
+    loadUrlIntoTab(currentTab.id, currentTab.url, false);
+  }, [currentTab, isNativeBrowserEngine, loadUrlIntoTab]);
 
   const stopLoadingCurrentTab = useCallback(() => {
     tabAbortRef.current.get(currentTabId)?.abort();
     tabAbortRef.current.delete(currentTabId);
+    const native = getSalviaNative();
+    if (isNativeBrowserEngine && native?.nativeStopLoading) {
+      native.nativeStopLoading();
+    }
     setTabPages((prev) => {
       const cur = prev[currentTabId];
       if (!cur) return prev;
       return { ...prev, [currentTabId]: { ...cur, isLoading: false, progress: 100 } };
     });
-  }, [currentTabId]);
+  }, [currentTabId, isNativeBrowserEngine]);
 
   const goBackCurrentTab = useCallback(() => {
-    if (!currentTab || currentTab.historyIndex <= 0) return;
+    if (!currentTab) return;
+    const showcase = BUILTIN_SHOWCASE_PAGES.some((p) => p.url === currentTab.url);
+    const native = getSalviaNative();
+    if (isNativeBrowserEngine && !showcase && nativeNavCaps[currentTab.id]?.canGoBack && native?.nativeGoBack) {
+      native.nativeGoBack();
+      return;
+    }
+    if (currentTab.historyIndex <= 0) return;
     const nextIdx = currentTab.historyIndex - 1;
     const targetUrl = currentTab.historyStack[nextIdx];
     setTabs((prev) =>
       prev.map((tab) => (tab.id === currentTab.id ? { ...tab, historyIndex: nextIdx } : tab))
     );
     loadUrlIntoTab(currentTab.id, targetUrl, false);
-  }, [currentTab, loadUrlIntoTab]);
+  }, [currentTab, isNativeBrowserEngine, nativeNavCaps, loadUrlIntoTab]);
 
   const goForwardCurrentTab = useCallback(() => {
-    if (!currentTab || currentTab.historyIndex >= currentTab.historyStack.length - 1) return;
+    if (!currentTab) return;
+    const showcase = BUILTIN_SHOWCASE_PAGES.some((p) => p.url === currentTab.url);
+    const native = getSalviaNative();
+    if (isNativeBrowserEngine && !showcase && nativeNavCaps[currentTab.id]?.canGoForward && native?.nativeGoForward) {
+      native.nativeGoForward();
+      return;
+    }
+    if (currentTab.historyIndex >= currentTab.historyStack.length - 1) return;
     const nextIdx = currentTab.historyIndex + 1;
     const targetUrl = currentTab.historyStack[nextIdx];
     setTabs((prev) =>
       prev.map((tab) => (tab.id === currentTab.id ? { ...tab, historyIndex: nextIdx } : tab))
     );
     loadUrlIntoTab(currentTab.id, targetUrl, false);
-  }, [currentTab, loadUrlIntoTab]);
+  }, [currentTab, isNativeBrowserEngine, nativeNavCaps, loadUrlIntoTab]);
 
   const goHomeInCurrentTab = useCallback(() => {
     if (currentTab?.url) {
@@ -928,14 +990,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       );
       setCurrentTabId(tabId);
       setIsTabSwitcherVisible(false);
-      if (wasHibernated) {
-        const target = tabs.find((item) => item.id === tabId);
-        if (target?.url) {
-          loadUrlIntoTab(tabId, target.url, false);
-        }
+      const target = tabs.find((item) => item.id === tabId);
+      if (target?.url && (wasHibernated || isNativeBrowserEngine)) {
+        loadUrlIntoTab(tabId, target.url, false);
       }
     },
-    [hibernatedTabIds, tabs, loadUrlIntoTab]
+    [hibernatedTabIds, tabs, isNativeBrowserEngine, loadUrlIntoTab]
   );
 
   const closeTab = useCallback(
@@ -1605,10 +1665,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   }, [showToast, t]);
 
   const clearCookiesAndStorage = useCallback(() => {
+    getSalviaNative()?.nativeClearBrowserData?.();
     showToast(t('settings_cookies_cleared'));
   }, [showToast, t]);
 
   const clearAllBrowsingData = useCallback(() => {
+    getSalviaNative()?.nativeClearBrowserData?.();
     setHistory([]);
     showToast(t('settings_browsing_data_cleared'));
   }, [showToast, t]);
@@ -1838,10 +1900,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     removeLockedFolderPasswordAction,
     findInPage,
     openFindInPage: () => setFindInPage({ query: '', matches: 0, activeMatch: 0 }),
-    closeFindInPage: () => setFindInPage(null),
+    closeFindInPage: () => {
+      getSalviaNative()?.nativeClearFindInPage?.();
+      setFindInPage(null);
+    },
     updateFindQuery: (query: string) => setFindInPage((prev) => (prev ? { ...prev, query } : { query, matches: 0, activeMatch: 0 })),
     setFindResult: (matches: number, activeMatch: number) =>
       setFindInPage((prev) => (prev ? { ...prev, matches, activeMatch } : null)),
+    isNativeBrowserEngine,
+    nativeNavCaps,
     reportDetectedMediaFromBridge,
     reportVisibleMediaFromBridge,
     connectionKind,
@@ -1853,6 +1920,155 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     toastMessage,
     showToast,
   };
+
+  // Sync browser runtime preferences to Android native WebView cleanly
+  useEffect(() => {
+    if (!isNativeBrowserEngine) return;
+    const host = hostOfUrl(currentTab?.url) || '';
+    const adBlockActive = settings.isAdBlockEnabled && !settings.adBlockDisabledSites.includes(host);
+    getSalviaNative()?.nativeUpdateBrowserSettings?.(
+      settings.isDesktopSite,
+      settings.isJavaScriptEnabled,
+      adBlockActive,
+      settings.areCookiesEnabled,
+      pageZoom
+    );
+  }, [
+    isNativeBrowserEngine,
+    currentTab?.url,
+    settings.isDesktopSite,
+    settings.isJavaScriptEnabled,
+    settings.isAdBlockEnabled,
+    settings.adBlockDisabledSites,
+    settings.areCookiesEnabled,
+    pageZoom,
+  ]);
+
+  // Listen to native Chromium browserWebView events & live network media sniffing
+  useEffect(() => {
+    if (!isNativeBrowserEngine) return;
+    return registerNativeBrowserListener((ev) => {
+      const targetTabId = ev.tabId || currentTabIdRef.current;
+      if (ev.type === 'page-started') {
+        const host = hostOfUrl(ev.url) || ev.url;
+        setTabPages((prev) => ({
+          ...prev,
+          [targetTabId]: {
+            url: ev.url,
+            title: prev[targetTabId]?.title || host,
+            html: null,
+            isLoading: true,
+            progress: 18,
+            error: null,
+            isDemoShowcase: false,
+          },
+        }));
+        setTabs((prev) =>
+          prev.map((tab) => (tab.id === targetTabId ? { ...tab, url: ev.url } : tab))
+        );
+        setNativeNavCaps((prev) => ({
+          ...prev,
+          [targetTabId]: {
+            canGoBack: Boolean(ev.canGoBack),
+            canGoForward: Boolean(ev.canGoForward),
+          },
+        }));
+        if (!isYouTubeExcludedUrl(ev.url) && analyzePastedLink(ev.url)?.category === 'PLATFORM_PAGE') {
+          void extractMediaFromPageUrl(ev.url).then((extracted) => {
+            if (extracted.ok && extracted.candidates.length > 0) {
+              mergeTabCandidates(targetTabId, extracted.candidates);
+            }
+          });
+        }
+      } else if (ev.type === 'progress') {
+        setTabPages((prev) => {
+          const cur = prev[targetTabId];
+          if (!cur || !cur.isLoading) return prev;
+          if (Math.abs(ev.progress - cur.progress) < 5 && ev.progress < 100) return prev;
+          return {
+            ...prev,
+            [targetTabId]: {
+              ...cur,
+              progress: ev.progress,
+              isLoading: ev.progress < 100,
+            },
+          };
+        });
+      } else if (ev.type === 'title') {
+        setTabPages((prev) => {
+          const cur = prev[targetTabId];
+          if (!cur) return prev;
+          return { ...prev, [targetTabId]: { ...cur, title: ev.title } };
+        });
+        setTabs((prev) =>
+          prev.map((tab) => (tab.id === targetTabId ? { ...tab, title: ev.title } : tab))
+        );
+      } else if (ev.type === 'page-finished') {
+        const finalTitle = ev.title || hostOfUrl(ev.url) || ev.url;
+        setTabPages((prev) => ({
+          ...prev,
+          [targetTabId]: {
+            url: ev.url,
+            title: finalTitle,
+            html: null,
+            isLoading: false,
+            progress: 100,
+            error: null,
+            isDemoShowcase: false,
+          },
+        }));
+        setTabs((prev) =>
+          prev.map((tab) => (tab.id === targetTabId ? { ...tab, url: ev.url, title: finalTitle } : tab))
+        );
+        setNativeNavCaps((prev) => ({
+          ...prev,
+          [targetTabId]: {
+            canGoBack: Boolean(ev.canGoBack),
+            canGoForward: Boolean(ev.canGoForward),
+          },
+        }));
+        const tabObj = tabsRef.current.find((tItem) => tItem.id === targetTabId);
+        if (tabObj && !tabObj.isPrivate) {
+          setHistory((prev) => [
+            { id: makeId('hist'), title: finalTitle, url: ev.url, visitedAt: Date.now() },
+            ...prev.filter((h) => h.url !== ev.url).slice(0, 199),
+          ]);
+        }
+      } else if (ev.type === 'adblock-blocked') {
+        setSettings((prev) => ({
+          ...prev,
+          adBlockBlockedRequests: prev.adBlockBlockedRequests + 1,
+        }));
+      } else if (ev.type === 'media-sniffed') {
+        if (!ev.mediaUrl || isYouTubeExcludedUrl(ev.mediaUrl) || isYouTubeExcludedUrl(ev.pageUrl)) {
+          return;
+        }
+        const ext = ev.mediaUrl.split('.').pop()?.split('?')[0]?.split('#')[0]?.toLowerCase() || 'mp4';
+        const sniffedCandidate: MediaCandidate = {
+          id: `sniff-${ev.mediaUrl}`,
+          pageUrl: ev.pageUrl || tabsRef.current.find((x) => x.id === targetTabId)?.url || '',
+          mediaUrl: ev.mediaUrl,
+          title: tabsRef.current.find((x) => x.id === targetTabId)?.title || ev.mediaUrl.split('/').pop(),
+          mimeType: ev.mimeType || (ext === 'm3u8' ? 'application/vnd.apple.mpegurl' : ext === 'mpd' ? 'application/dash+xml' : 'video/mp4'),
+          extension: ext.length <= 5 ? ext : 'mp4',
+          source: ev.source || 'FETCH',
+          confidence: 0.92,
+        };
+        mergeTabCandidates(targetTabId, [sniffedCandidate]);
+      } else if (ev.type === 'media-dom') {
+        reportDetectedMediaFromBridge(targetTabId, ev.pageUrl, ev.items);
+      } else if (ev.type === 'visible-media') {
+        reportVisibleMediaFromBridge(targetTabId, ev.pageUrl, ev.mediaUrl);
+      } else if (ev.type === 'find-result') {
+        setFindInPage((prev) => (prev ? { ...prev, matches: ev.matches, activeMatch: ev.active } : null));
+      }
+    });
+  }, [
+    isNativeBrowserEngine,
+    mergeTabCandidates,
+    reportDetectedMediaFromBridge,
+    reportVisibleMediaFromBridge,
+  ]);
 
   useEffect(() => {
     return registerNativeBackHandler(() => {

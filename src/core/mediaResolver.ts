@@ -309,68 +309,175 @@ export function parseHlsPlaylist(manifestText: string, baseUrl: string, title: s
   };
 }
 
+function parseXmlAttributes(attrText: string): Record<string, string> {
+  const attrs: Record<string, string> = {};
+  const attrRe = /([A-Za-z0-9_:-]+)\s*=\s*"([^"]*)"/g;
+  let m: RegExpExecArray | null;
+  while ((m = attrRe.exec(attrText)) !== null) {
+    attrs[m[1]] = m[2];
+  }
+  return attrs;
+}
+
 export function parseDashManifest(manifestText: string, baseUrl: string): HlsParseResult {
   const lower = manifestText.toLowerCase();
   if (lower.includes('contentprotection')) {
     return { formats: [], unsupported: 'DRM' };
   }
   if (lower.includes('type="dynamic"') || (manifestText.match(/<Period\b/gi)?.length ?? 0) > 1) {
-    return { formats: [], unsupported: 'DASH' };
+    return { formats: [], unsupported: 'LIVE' };
   }
 
-  const doc = new DOMParser().parseFromString(manifestText, 'application/xml');
-  const adaptations = Array.from(doc.querySelectorAll('AdaptationSet'));
   const formats: MediaFormat[] = [];
+  const audioFormats: MediaFormat[] = [];
   let bestAudioUrl: string | null = null;
   let bestAudioBitrate = 0;
 
-  for (const set of adaptations) {
-    const mime = set.getAttribute('mimeType') || '';
-    if (mime.startsWith('audio/')) {
-      set.querySelectorAll('Representation').forEach((rep) => {
+  interface ParsedRep {
+    id: string;
+    mime: string;
+    bandwidth: number;
+    width: number | null;
+    height: number | null;
+    baseUrl: string | null;
+    hasSegments: boolean;
+  }
+
+  const reps: ParsedRep[] = [];
+
+  if (typeof DOMParser !== 'undefined') {
+    const doc = new DOMParser().parseFromString(manifestText, 'application/xml');
+    const adaptations = Array.from(doc.querySelectorAll('AdaptationSet'));
+    for (const set of adaptations) {
+      const setMime =
+        set.getAttribute('mimeType') ||
+        (set.getAttribute('contentType') === 'audio'
+          ? 'audio/mp4'
+          : set.getAttribute('contentType') === 'video'
+            ? 'video/mp4'
+            : '');
+      const setHasTpl = Boolean(set.querySelector('SegmentTemplate, SegmentList'));
+      const setBase = set.querySelector(':scope > BaseURL')?.textContent?.trim() || null;
+
+      set.querySelectorAll('Representation').forEach((rep, idx) => {
+        const mime = (rep.getAttribute('mimeType') || setMime || '').toLowerCase();
         const bw = Number(rep.getAttribute('bandwidth') || 0);
-        const base = rep.querySelector('BaseURL')?.textContent?.trim();
-        if (base && bw >= bestAudioBitrate) {
-          bestAudioBitrate = bw;
-          bestAudioUrl = resolveRelativeUrl(baseUrl, base);
-        }
+        const width = Number(rep.getAttribute('width') || set.getAttribute('width') || 0) || null;
+        const height = Number(rep.getAttribute('height') || set.getAttribute('height') || 0) || null;
+        const repId = rep.getAttribute('id') || `${height || 'track'}_${bw || idx}`;
+        const repBase = rep.querySelector('BaseURL')?.textContent?.trim() || setBase;
+        const hasSeg = setHasTpl || Boolean(rep.querySelector('SegmentTemplate, SegmentList'));
+        reps.push({
+          id: repId,
+          mime,
+          bandwidth: bw,
+          width,
+          height,
+          baseUrl: repBase,
+          hasSegments: hasSeg,
+        });
       });
+    }
+  } else {
+    // Lightweight Node-safe fallback for unit testing & headless checks
+    const adaptRe = /<AdaptationSet\b([^>]*)>([\s\S]*?)<\/AdaptationSet>/gi;
+    let am: RegExpExecArray | null;
+    while ((am = adaptRe.exec(manifestText)) !== null) {
+      const setAttrs = parseXmlAttributes(am[1]);
+      const body = am[2];
+      const setMime =
+        setAttrs.mimeType ||
+        (setAttrs.contentType === 'audio'
+          ? 'audio/mp4'
+          : setAttrs.contentType === 'video'
+            ? 'video/mp4'
+            : '');
+      const setHasTpl = /<(?:SegmentTemplate|SegmentList)\b/i.test(body);
+      const repRe = /<Representation\b([^>]*?)(?:\/>|>([\s\S]*?)<\/Representation>)/gi;
+      let rm: RegExpExecArray | null;
+      while ((rm = repRe.exec(body)) !== null) {
+        const rAttrs = parseXmlAttributes(rm[1]);
+        const rBody = rm[2] || '';
+        const mime = (rAttrs.mimeType || setMime || '').toLowerCase();
+        const bw = Number(rAttrs.bandwidth || 0);
+        const width = Number(rAttrs.width || setAttrs.width || 0) || null;
+        const height = Number(rAttrs.height || setAttrs.height || 0) || null;
+        const repId = rAttrs.id || `${height || 'track'}_${bw || reps.length}`;
+        const baseMatch = rBody.match(/<BaseURL[^>]*>([^<]+)<\/BaseURL>/i);
+        const hasSeg = setHasTpl || /<(?:SegmentTemplate|SegmentList)\b/i.test(rBody);
+        reps.push({
+          id: repId,
+          mime,
+          bandwidth: bw,
+          width,
+          height,
+          baseUrl: baseMatch?.[1]?.trim() || null,
+          hasSegments: hasSeg,
+        });
+      }
     }
   }
 
-  for (const set of adaptations) {
-    const mime = set.getAttribute('mimeType') || 'video/mp4';
-    if (!mime.startsWith('video/')) continue;
-    set.querySelectorAll('Representation').forEach((rep) => {
-      const bw = Number(rep.getAttribute('bandwidth') || 0);
-      const width = Number(rep.getAttribute('width') || 0) || null;
-      const height = Number(rep.getAttribute('height') || 0) || null;
-      const base = rep.querySelector('BaseURL')?.textContent?.trim();
-      const repUrl = base ? resolveRelativeUrl(baseUrl, base) : baseUrl;
-      if (!repUrl) return;
-      formats.push({
-        id: `dash-${formats.length}-${rep.getAttribute('id') || height || bw}`,
-        format: height ? `${height}p${bestAudioUrl ? ' + audio' : ''}` : `${Math.round(bw / 1000)} kbps`,
-        url: repUrl,
-        mimeType: DASH_MIME_TYPE,
-        extension: 'mp4',
-        width,
-        height,
-        bitrate: bw > 0 ? Math.round(bw / 1000) : null,
-        isVideo: true,
-        isAudio: Boolean(bestAudioUrl),
-        isDash: true,
-        audioTrackUrl: bestAudioUrl,
-      });
+  for (const r of reps) {
+    if (r.mime.startsWith('audio/')) {
+      const targetUrl =
+        !r.hasSegments && r.baseUrl
+          ? resolveRelativeUrl(baseUrl, r.baseUrl)
+          : `${baseUrl.split('#')[0]}#salvia_rep=${encodeURIComponent(r.id)}`;
+      if (targetUrl && r.bandwidth >= bestAudioBitrate) {
+        bestAudioBitrate = r.bandwidth;
+        bestAudioUrl = targetUrl;
+      }
+      if (targetUrl) {
+        audioFormats.push({
+          id: `dash-audio-${r.id}`,
+          format: `Audio · ${Math.max(1, Math.round(r.bandwidth / 1000))} kbps`,
+          url: targetUrl,
+          mimeType: r.mime || 'audio/mp4',
+          extension: 'm4a',
+          bitrate: r.bandwidth > 0 ? Math.round(r.bandwidth / 1000) : null,
+          isVideo: false,
+          isAudio: true,
+          isDash: true,
+        });
+      }
+    }
+  }
+
+  for (const r of reps) {
+    if (r.mime.startsWith('audio/')) continue;
+    const isDirectFile = !r.hasSegments && Boolean(r.baseUrl);
+    const resolvedBase = isDirectFile && r.baseUrl ? resolveRelativeUrl(baseUrl, r.baseUrl) : null;
+    const trackUrl =
+      resolvedBase || `${baseUrl.split('#')[0]}#salvia_rep=${encodeURIComponent(r.id)}`;
+    const kbps = r.bandwidth > 0 ? Math.round(r.bandwidth / 1000) : null;
+    formats.push({
+      id: `dash-${formats.length}-${r.id}`,
+      format: r.height
+        ? `${r.height}p${bestAudioUrl ? ' + audio' : ''}`
+        : kbps
+          ? `${kbps} kbps`
+          : `DASH Track ${formats.length + 1}`,
+      url: trackUrl,
+      mimeType: isDirectFile ? r.mime || 'video/mp4' : DASH_MIME_TYPE,
+      extension: 'mp4',
+      width: r.width,
+      height: r.height,
+      bitrate: kbps,
+      isVideo: true,
+      isAudio: Boolean(bestAudioUrl) || !isDirectFile,
+      isDash: true,
+      audioTrackUrl: isDirectFile ? bestAudioUrl : null,
     });
   }
 
-  if (formats.length === 0) {
+  if (formats.length === 0 && audioFormats.length === 0) {
     return { formats: [], unsupported: 'DASH' };
   }
 
   formats.sort((a, b) => (b.height ?? 0) - (a.height ?? 0) || (b.bitrate ?? 0) - (a.bitrate ?? 0));
-  return { formats, unsupported: null };
+  audioFormats.sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0));
+  return { formats, audioFormats, unsupported: null };
 }
 
 export function initialMediaInfoForCandidate(candidate: MediaCandidate): MediaInfo {
@@ -474,10 +581,15 @@ export async function probeMediaCandidate(candidate: MediaCandidate): Promise<{
         return { mediaInfo: { ...baseInfo, formats: [], combinedFormats: [] }, unsupported: parsed.unsupported };
       }
       const withRef = parsed.formats.map((f) => ({ ...f, referer: candidate.pageUrl || null }));
+      const audioWithRef = (parsed.audioFormats ?? baseInfo.audioFormats).map((f) => ({
+        ...f,
+        referer: candidate.pageUrl || null,
+      }));
       return {
         mediaInfo: {
           ...baseInfo,
           formats: withRef,
+          audioFormats: audioWithRef,
           combinedFormats: withRef,
         },
         unsupported: null,

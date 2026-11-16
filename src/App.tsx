@@ -3,11 +3,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { AppSplashOverlay } from './components/AppSplashOverlay';
 import { MediaQualitySelectionSheet } from './components/MediaQualitySelectionSheet';
 import { MediaTraySheet } from './components/MediaTraySheet';
 import { TabSwitcher } from './components/TabSwitcher';
+import { getSalviaNative } from './core/nativeBridge';
 import { BookmarksScreen } from './screens/BookmarksScreen';
 import { BrowserScreen } from './screens/BrowserScreen';
 import { DownloadsScreen } from './screens/DownloadsScreen';
@@ -20,6 +21,12 @@ import { AppProvider, useApp } from './store/AppContext';
 const SalviaShell: React.FC = () => {
   const { route, toastMessage } = useApp();
   const [splashDone, setSplashDone] = useState(false);
+
+  useEffect(() => {
+    if (route !== 'browser') {
+      getSalviaNative()?.setBrowserViewport?.(false, 0, 0, 0, 0);
+    }
+  }, [route]);
 
   const renderScreen = () => {
     switch (route) {
