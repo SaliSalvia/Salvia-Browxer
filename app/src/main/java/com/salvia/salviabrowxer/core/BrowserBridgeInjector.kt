@@ -340,10 +340,13 @@ object BrowserBridgeInjector {
         val baseTag = "<base href=\"$escapedBase\">"
         val bridgeScript = "<script>\n${buildDetectorScript(finalUrl, isLiveWebView = false)}\n</script>"
 
-        cleaned = if (headOpenRegex.containsMatchIn(cleaned)) {
-            headOpenRegex.replaceFirst(cleaned) { match ->
-                "${match.value}$baseTag$bridgeScript"
-            }
+        val headMatch = headOpenRegex.find(cleaned)
+        cleaned = if (headMatch != null) {
+            // Insert right after the opening <head> tag of the first match only.
+            // Regex.replaceFirst has no lambda overload, so the insertion is done
+            // by slicing at the end of the matched range.
+            val insertAt = headMatch.range.last + 1
+            cleaned.substring(0, insertAt) + baseTag + bridgeScript + cleaned.substring(insertAt)
         } else {
             "$baseTag$bridgeScript$cleaned"
         }
