@@ -1,5 +1,4 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import Hls from 'hls.js';
 import {
   ArrowLeft,
   ArrowRight,
@@ -71,37 +70,55 @@ export const MediaPlayerScreen: React.FC = () => {
     setCurrentTime(0);
     setDuration(0);
 
-    let hls: Hls | null = null;
     const isHlsSource = Boolean(playerTarget?.isHls) || activeUrl.toLowerCase().includes('.m3u8');
+    let disposed = false;
+    let hls: import('hls.js').default | null = null;
+    let usedNativeSource = false;
 
-    if (isHlsSource && Hls.isSupported()) {
-      hls = new Hls({ enableWorker: true, lowLatencyMode: false });
-      let networkRecovered = false;
-      let mediaRecovered = false;
-      hls.loadSource(activeUrl);
-      hls.attachMedia(video);
-      hls.on(Hls.Events.ERROR, (_ev, data) => {
-        if (!data.fatal) return;
-        if (data.type === Hls.ErrorTypes.NETWORK_ERROR && !networkRecovered) {
-          networkRecovered = true;
-          hls?.startLoad();
-          return;
-        }
-        if (data.type === Hls.ErrorTypes.MEDIA_ERROR && !mediaRecovered) {
-          mediaRecovered = true;
-          hls?.recoverMediaError();
-          return;
-        }
-        setLoadError(t('player_playback_failed'));
-      });
+    if (isHlsSource) {
+      // hls.js is the single largest dependency; loading it on demand keeps the
+      // first paint of the browser and the home screen lightweight.
+      void import('hls.js')
+        .then(({ default: Hls }) => {
+          if (disposed) return;
+          if (!Hls.isSupported()) {
+            video.src = activeUrl;
+            usedNativeSource = true;
+            return;
+          }
+          hls = new Hls({ enableWorker: true, lowLatencyMode: false });
+          let networkRecovered = false;
+          let mediaRecovered = false;
+          hls.loadSource(activeUrl);
+          hls.attachMedia(video);
+          hls.on(Hls.Events.ERROR, (_ev, data) => {
+            if (!data.fatal) return;
+            if (data.type === Hls.ErrorTypes.NETWORK_ERROR && !networkRecovered) {
+              networkRecovered = true;
+              hls?.startLoad();
+              return;
+            }
+            if (data.type === Hls.ErrorTypes.MEDIA_ERROR && !mediaRecovered) {
+              mediaRecovered = true;
+              hls?.recoverMediaError();
+              return;
+            }
+            setLoadError(t('player_playback_failed'));
+          });
+        })
+        .catch(() => {
+          if (!disposed) setLoadError(t('player_playback_failed'));
+        });
     } else {
       video.src = activeUrl;
+      usedNativeSource = true;
     }
 
     return () => {
+      disposed = true;
       if (hls) {
         hls.destroy();
-      } else {
+      } else if (usedNativeSource) {
         video.pause();
         video.removeAttribute('src');
         video.load();

@@ -9,12 +9,19 @@ import {
 } from '../core/constants';
 import {
   cancelTransfer,
+  discardPartialTransfer,
   getCompletedBlobUrl,
   pauseTransfer,
+  registerCompletedBlobUrl,
   releaseBlobUrl,
   startTransfer,
   triggerBrowserFileSave,
 } from '../core/downloadEngine';
+import {
+  isStreamRecordingSupported,
+  startStreamRecording,
+  type StreamRecorderHandle,
+} from '../core/streamRecorder';
 import {
   extractMediaFromPageUrl,
   initialMediaInfoForCandidate,
@@ -34,7 +41,7 @@ import {
   pastedMediaCandidate,
 } from '../core/pastedLink';
 import { resolveAddressBarInput } from '../core/addressBarResolver';
-import { isBlockedAdHost, hostOfUrl } from '../core/adBlockRules';
+import { hostOfUrl } from '../core/adBlockRules';
 import {
   LockoutPolicy,
   isPasswordConfigured,
@@ -340,7 +347,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [downloads, setDownloads] = useState<DownloadItemRecord[]>(() =>
     loadJson<DownloadItemRecord[]>(STORAGE_KEYS.downloads, []).map((d) =>
       d.status === 'DOWNLOADING' || d.status === 'PREPARING' || d.status === 'RESOLVING'
-        ? { ...d, status: 'PAUSED', bytesPerSecond: 0, etaSeconds: null }
+        ? // The bytes of an interrupted transfer live in memory only, so a reloaded row
+          // reports zero instead of promising a resume point it can no longer honour.
+          { ...d, status: 'PAUSED', downloadedBytes: 0, bytesPerSecond: 0, etaSeconds: null }
         : d
     )
   );
@@ -428,6 +437,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   >({});
 
   const [tabPages, setTabPages] = useState<Record<string, TabPageRenderState>>({});
+  const tabPagesRef = useRef<Record<string, TabPageRenderState>>(tabPages);
+  tabPagesRef.current = tabPages;
   const [tabMedia, setTabMedia] = useState<Record<string, MediaCandidate[]>>({});
   const [tabVisibleMedia, setTabVisibleMedia] = useState<Record<string, string | null>>({});
   const [isTabSwitcherVisible, setIsTabSwitcherVisible] = useState(false);
@@ -991,7 +1002,18 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setCurrentTabId(tabId);
       setIsTabSwitcherVisible(false);
       const target = tabs.find((item) => item.id === tabId);
-      if (target?.url && (wasHibernated || isNativeBrowserEngine)) {
+      if (!target?.url) return;
+      if (isNativeBrowserEngine) {
+        // The native engine renders through one shared browser WebView, so the tab has
+        // to be navigated before it can be shown.
+        loadUrlIntoTab(tabId, target.url, false);
+        return;
+      }
+      const page = tabPagesRef.current[tabId];
+      const hasRenderablePage = Boolean(
+        page && (page.html || page.isLoading || page.error || page.isDemoShowcase)
+      );
+      if (wasHibernated || !hasRenderablePage) {
         loadUrlIntoTab(tabId, target.url, false);
       }
     },
@@ -1048,9 +1070,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   );
 
   // Download Queue & Scheduling
+  const startingIdsRef = useRef<Set<string>>(new Set());
   const runDownloadItem = useCallback(
     (record: DownloadItemRecord) => {
+      if (startingIdsRef.current.has(record.id)) return;
+      startingIdsRef.current.add(record.id);
       if (settings.isWifiOnly && connectionKind !== 'WIFI') {
+        startingIdsRef.current.delete(record.id);
         setDownloads((prev) =>
           prev.map((d) =>
             d.id === record.id
@@ -1067,7 +1093,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         )
       );
 
-      startTransfer(
+      void startTransfer(
         record.id,
         record.url,
         Boolean(record.isHls),
@@ -1101,6 +1127,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
                       bytesPerSecond: 0,
                       etaSeconds: null,
                       mimeType,
+                      // A concatenated MPEG-TS playlist is a .ts file, calling it .mp4
+                      // would hand the user a file most players refuse to open.
+                      filename:
+                        mimeType === 'video/mp2t'
+                          ? d.filename.replace(/\.(mp4|m4v|m4a|webm)$/i, '.ts')
+                          : d.filename,
                       blobUrl,
                       nativeUri: nativeUri ?? d.nativeUri ?? null,
                       exportedToGallery: settings.isExportToGallery,
@@ -1115,18 +1147,32 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             showToast(t('download_finished_named', { name: record.mediaTitle || record.filename }));
             logEvent('transfer', hostOfUrl(record.url) || 'media', 'completed');
           },
-          onPaused: () => {
-            setDownloads((prev) =>
-              prev.map((d) =>
-                d.id === record.id ? { ...d, status: 'PAUSED', bytesPerSecond: 0, etaSeconds: null } : d
-              )
-            );
-          },
-          onCancelled: () => {
+          onPaused: (downloadedBytes) => {
             setDownloads((prev) =>
               prev.map((d) =>
                 d.id === record.id
-                  ? { ...d, status: 'CANCELLED', bytesPerSecond: 0, etaSeconds: null }
+                  ? {
+                      ...d,
+                      status: 'PAUSED',
+                      downloadedBytes: downloadedBytes ?? d.downloadedBytes,
+                      bytesPerSecond: 0,
+                      etaSeconds: null,
+                    }
+                  : d
+              )
+            );
+          },
+          onCancelled: (downloadedBytes) => {
+            setDownloads((prev) =>
+              prev.map((d) =>
+                d.id === record.id
+                  ? {
+                      ...d,
+                      status: 'CANCELLED',
+                      downloadedBytes: downloadedBytes ?? d.downloadedBytes,
+                      bytesPerSecond: 0,
+                      etaSeconds: null,
+                    }
                   : d
               )
             );
@@ -1148,8 +1194,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           autoSaveToGallery: settings.isExportToGallery,
           audioTrackUrl: record.audioTrackUrl ?? null,
           referer: record.pageUrl ?? null,
+          resumeFrom: record.downloadedBytes,
         }
-      );
+      ).finally(() => {
+        startingIdsRef.current.delete(record.id);
+      });
     },
     [settings.isWifiOnly, settings.isExportToGallery, settings.parallelConnections, connectionKind, showToast, t, logEvent]
   );
@@ -1339,6 +1388,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const deleteDownload = useCallback((id: string) => {
     cancelTransfer(id);
+    discardPartialTransfer(id);
     releaseBlobUrl(id);
     setDownloads((prev) => prev.filter((d) => d.id !== id));
   }, []);
@@ -1348,7 +1398,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       prev.filter((d) => {
         if (bucket === 'active') {
           const isAct = d.status === 'DOWNLOADING' || d.status === 'PAUSED' || d.status === 'PREPARING';
-          if (isAct) cancelTransfer(d.id);
+          if (isAct) {
+            cancelTransfer(d.id);
+            discardPartialTransfer(d.id);
+          }
           return !isAct;
         }
         if (bucket === 'completed') {
@@ -1517,47 +1570,88 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   }, [rankedTabCandidates.length, currentMainCandidate, currentTabCandidates.length, openQualitySheetForCandidate, showToast, t]);
 
-  // Playback Recording simulation/controller for MSE streams
+  // Playback capture for blob/MSE streams: real MediaRecorder output, never a
+  // simulated byte counter. Unsupported runtimes get an honest refusal.
   const [recording, setRecording] = useState<RecordingState>({ isRecording: false, bytes: 0 });
-  const recordTimerRef = useRef<number | null>(null);
-  const startRecordingPlayback = useCallback(() => {
-    setRecording({ isRecording: true, bytes: 0 });
-    if (recordTimerRef.current) window.clearInterval(recordTimerRef.current);
-    recordTimerRef.current = window.setInterval(() => {
-      setRecording((prev) => (prev.isRecording ? { isRecording: true, bytes: prev.bytes + 65536 } : prev));
-    }, 500);
+  const recorderRef = useRef<StreamRecorderHandle | null>(null);
+
+  useEffect(() => {
+    return () => {
+      recorderRef.current?.cancel();
+      recorderRef.current = null;
+    };
   }, []);
 
-  const stopRecordingPlayback = useCallback(() => {
-    if (recordTimerRef.current) {
-      window.clearInterval(recordTimerRef.current);
-      recordTimerRef.current = null;
+  const startRecordingPlayback = useCallback(() => {
+    const candidate = qualitySheet?.candidate;
+    if (!candidate?.mediaUrl) return;
+    if (!isStreamRecordingSupported()) {
+      showToast(t('recording_unavailable'));
+      return;
     }
-    setRecording((prev) => {
-      if (prev.isRecording && prev.bytes > 0) {
-        const title = qualitySheet?.mediaInfo.title || 'Recorded stream';
-        const rec: DownloadItemRecord = {
-          id: makeId('rec'),
-          url: qualitySheet?.candidate.mediaUrl || currentTab?.url || '',
-          mediaTitle: `${title} (Recording)`,
-          filename: `${sanitizeFilename(title)}_recording.webm`,
-          mimeType: 'video/webm',
-          status: 'COMPLETED',
-          downloadedBytes: prev.bytes,
-          totalBytes: prev.bytes,
-          bytesPerSecond: 0,
-          etaSeconds: null,
-          isLocked: false,
-          exportedToGallery: false,
-          createdAt: Date.now(),
-          completedAt: Date.now(),
-        };
-        setDownloads((d) => [rec, ...d]);
-        showToast(t('recording_saved'));
+    if (recorderRef.current) return;
+    setRecording({ isRecording: false, bytes: 0 });
+    void (async () => {
+      const handle = await startStreamRecording(candidate.mediaUrl, {
+        referer: candidate.pageUrl ?? null,
+        onBytes: (bytes) => setRecording({ isRecording: true, bytes }),
+      });
+      if (!handle) {
+        setRecording({ isRecording: false, bytes: 0 });
+        showToast(t('recording_unavailable'));
+        return;
       }
-      return { isRecording: false, bytes: 0 };
-    });
-  }, [qualitySheet, currentTab?.url, showToast, t]);
+      recorderRef.current = handle;
+      setRecording({ isRecording: true, bytes: 0 });
+    })();
+  }, [qualitySheet?.candidate, showToast, t]);
+
+  const stopRecordingPlayback = useCallback(() => {
+    const handle = recorderRef.current;
+    recorderRef.current = null;
+    void (async () => {
+      const result = handle ? await handle.stop() : null;
+      if (!result || result.blob.size === 0) {
+        setRecording({ isRecording: false, bytes: 0 });
+        showToast(t('recording_unavailable'));
+        return;
+      }
+      const title = qualitySheet?.mediaInfo.title || currentTab?.title || 'Recording';
+      const id = makeId('rec');
+      const blobUrl = URL.createObjectURL(result.blob);
+      registerCompletedBlobUrl(id, blobUrl);
+      const extension = result.mimeType.includes('mp4') ? 'mp4' : 'webm';
+      const rec: DownloadItemRecord = {
+        id,
+        url: qualitySheet?.candidate.mediaUrl || currentTab?.url || '',
+        mediaTitle: `${title} (Recording)`,
+        filename: `${sanitizeFilename(title)}_recording.${extension}`,
+        mimeType: result.mimeType || 'video/webm',
+        status: 'COMPLETED',
+        downloadedBytes: result.blob.size,
+        totalBytes: result.blob.size,
+        bytesPerSecond: 0,
+        etaSeconds: null,
+        isLocked: false,
+        exportedToGallery: false,
+        blobUrl,
+        createdAt: Date.now(),
+        completedAt: Date.now(),
+        pageUrl: qualitySheet?.mediaInfo.webpageUrl ?? null,
+      };
+      setDownloads((prev) => [rec, ...prev]);
+      setRecording({ isRecording: false, bytes: 0 });
+      showToast(t('recording_saved'));
+    })();
+  }, [
+    qualitySheet?.candidate,
+    qualitySheet?.mediaInfo.title,
+    qualitySheet?.mediaInfo.webpageUrl,
+    currentTab?.title,
+    currentTab?.url,
+    showToast,
+    t,
+  ]);
 
   // Bridge callbacks
   const reportDetectedMediaFromBridge = useCallback(
@@ -1578,7 +1672,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         isSuggested?: boolean;
       }>
     ) => {
-      const converted: MediaCandidate[] = items.map((item, idx) => ({
+      const converted: MediaCandidate[] = items
+        .filter((item) => Boolean(item) && /^https?:\/\//i.test(item.url))
+        .slice(0, 40)
+        .map((item, idx) => ({
         id: `bridge-${idx}-${item.url}`,
         pageUrl,
         mediaUrl: item.url,
@@ -1806,9 +1903,6 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     () => downloads.filter((d) => d.status === 'COMPLETED' && (!d.isLocked || isLockedFolderUnlocked)).length,
     [downloads, isLockedFolderUnlocked]
   );
-
-  // Ignore unused reference check for isBlockedAdHost
-  void isBlockedAdHost;
 
   const value: AppContextValue = {
     route,

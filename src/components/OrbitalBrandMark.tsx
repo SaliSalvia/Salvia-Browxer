@@ -7,7 +7,7 @@ interface OrbitalBrandMarkProps {
   showRing?: boolean;
 }
 
-export const LOGO_ASSET_PATH = './assets/aistudio/Picsart_26-11-04_21-40-17-985_7c4ea56f.jpg';
+export const LOGO_ASSET_PATH = './assets/salvia_icon.jpg';
 
 export const OrbitalBrandMark: React.FC<OrbitalBrandMarkProps> = ({
   size = 32,

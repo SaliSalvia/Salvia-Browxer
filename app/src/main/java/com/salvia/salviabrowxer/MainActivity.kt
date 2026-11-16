@@ -21,6 +21,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.ViewOutlineProvider
 import android.webkit.CookieManager
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -397,6 +398,30 @@ class MainActivity : AppCompatActivity() {
                     }
 
                     return super.shouldInterceptRequest(view, request)
+                }
+
+                override fun onRenderProcessGone(
+                    view: WebView?,
+                    detail: RenderProcessGoneDetail?
+                ): Boolean {
+                    // A renderer crash on a heavy page must never take the whole app
+                    // down: drop the dead WebView so the next navigation rebuilds it.
+                    runOnUiThread {
+                        val dead = view ?: return@runOnUiThread
+                        rootContainer.removeView(dead)
+                        dead.destroy()
+                        if (browserWebView === dead) {
+                            browserWebView = null
+                        }
+                    }
+                    emitUiBrowserEvent(
+                        JSONObject()
+                            .put("type", "page-finished")
+                            .put("tabId", activeTabId)
+                            .put("url", activePageUrl)
+                            .put("title", activePageUrl)
+                    )
+                    return true
                 }
             }
         }

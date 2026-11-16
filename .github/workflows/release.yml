@@ -140,7 +140,6 @@ jobs:
           rm -rf app/src/main/assets/www
           mkdir -p app/src/main/assets/www
           cp -r dist/* app/src/main/assets/www/
-          rm -f app/src/main/assets/www/assets/aistudio/*.zip
           test -f app/src/main/assets/www/index.html || { echo "assets/www/index.html missing"; exit 1; }
 
       - name: Set up Gradle and restore dependency cache

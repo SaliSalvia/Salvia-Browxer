@@ -11,6 +11,17 @@ import {
   unescapeEmbeddedText,
   validateRemoteUrl,
 } from './server/mediaExtractor';
+import { DASH_EXTENSION, MEDIA_EXTENSIONS, SEGMENT_EXTENSIONS } from './src/core/mediaUrlRules';
+
+/**
+ * The injected detector used to keep its own short extension list, so it missed
+ * formats the rest of the app accepts. It now derives from the single media rule
+ * set, minus the segment extensions, which are never offered as media.
+ */
+const BRIDGE_MEDIA_EXTENSIONS = Array.from(MEDIA_EXTENSIONS)
+  .filter((ext) => !SEGMENT_EXTENSIONS.has(ext))
+  .concat(DASH_EXTENSION)
+  .join('|');
 
 async function fetchWithTimeout(
   url: string,
@@ -66,7 +77,7 @@ function injectBrowserBridge(html: string, finalUrl: string, adBlock: boolean): 
   }
   function isMediaUrl(u) {
     if (!u || typeof u !== 'string' || u.startsWith('data:') || u.startsWith('javascript:')) return false;
-    if (/\\.(mp4|webm|mov|m4v|m3u8|mpd|mp3|m4a|aac|ogg|opus|flac|wav)(\\?|#|$)/i.test(u)) return true;
+    if (/\\.(${BRIDGE_MEDIA_EXTENSIONS})(\\?|#|$)/i.test(u)) return true;
     return /[?&](?:mime|type)=video|[?&]format=mp4/i.test(u) || /video\\.twimg\\.com\\/|cdninstagram\\.com\\/v\\/t|fbcdn\\.net\\/v\\/t|tiktokcdn/i.test(u);
   }
   function classifyEl(el, url) {
@@ -300,9 +311,12 @@ function injectBrowserBridge(html: string, finalUrl: string, adBlock: boolean): 
   return { html: cleaned, blockedCount };
 }
 
+const MAX_HTML_BYTES = 8 * 1024 * 1024;
+
 function sendJson(res: ServerResponse, status: number, body: unknown) {
   res.statusCode = status;
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
   res.end(JSON.stringify(body));
 }
 
@@ -348,7 +362,24 @@ function salviaMiddlewarePlugin(): Plugin {
               });
             }
             if (contentType.includes('text/html') || contentType.includes('application/xhtml+xml') || contentType === '') {
+              const declaredLength = Number(response.headers.get('content-length') || 0) || 0;
+              if (declaredLength > MAX_HTML_BYTES) {
+                return sendJson(res, 200, {
+                  ok: false,
+                  status: 413,
+                  statusText: 'Page is too large to proxy',
+                  finalUrl,
+                });
+              }
               const rawHtml = await response.text();
+              if (rawHtml.length > MAX_HTML_BYTES) {
+                return sendJson(res, 200, {
+                  ok: false,
+                  status: 413,
+                  statusText: 'Page is too large to proxy',
+                  finalUrl,
+                });
+              }
               const titleMatch = rawHtml.match(/<title[^>]*>([^<]*)<\/title>/i);
               const title = titleMatch ? unescapeEmbeddedText(titleMatch[1]).trim() : new URL(finalUrl).hostname;
               const { html, blockedCount } = injectBrowserBridge(rawHtml, finalUrl, adBlock);

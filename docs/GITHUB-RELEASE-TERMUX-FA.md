@@ -55,3 +55,40 @@ cat keystore_b64.txt
    - **روش تگ یا فایل `RELEASE`:** یک تگ مثل `v1.0.1` بزنید و پوش کنید (`git tag v1.0.1 && git push origin v1.0.1`) یا `versionCode`/`versionName` را در `app/build.gradle.kts` بالا ببرید و فایل `RELEASE` را تغییر دهید.
 
 4. ورک‌فلو ابتدا هر ۴ سکرت و کلید Termux را با `keytool` بررسی می‌کند (اگر یکی از رمزها یا alias اشتباه باشد در ثانیهٔ اول خطای دقیق می‌دهد)، سپس وب‌اپ و تست‌ها را می‌سازد، APK و AAB نسخهٔ Release را با امضای شخصی شما امضا و با `apksigner` تأیید می‌کند و هم در **Artifacts** و هم در بخش **Releases** مخزن منتشر می‌کند.
+
+---
+
+## ۵) تعریف سکرت‌ها مستقیم از Termux با `gh` (بدون باز کردن مرورگر)
+
+```bash
+pkg install gh
+gh auth login          # GitHub.com → HTTPS → Paste an authentication token
+gh auth status
+cd ~/SalviaBrowxer
+```
+
+فایل Base64 کلید را بسازید و همان‌جا به‌عنوان سکرت ثبت کنید (محتوا هیچ‌وقت چاپ یا کامیت نمی‌شود):
+
+```bash
+base64 -w 0 salvia-release.jks > keystore_b64.txt
+gh secret set SIGNING_KEYSTORE_BASE64 < keystore_b64.txt
+gh secret set SIGNING_KEYSTORE_PASSWORD   # مقدار را paste کنید، سپس Ctrl-D
+gh secret set SIGNING_KEY_ALIAS           # مثلاً salvia_key
+gh secret set SIGNING_KEY_PASSWORD        # در PKCS12 همان رمز keystore است
+gh secret list
+rm -f keystore_b64.txt
+```
+
+ساخت و پیگیری نسخهٔ امضاشده:
+
+```bash
+gh workflow run release.yml
+gh run watch
+gh release view --web   # یا: gh release download --pattern '*.apk'
+```
+
+- `gh secret set NAME < file` مقدار را از فایل می‌خواند و در ترمینال نمایش نمی‌دهد.
+- فایل `.jks`، `.keystore` و `keystore_b64.txt` در `.gitignore` مسدود شده‌اند؛ هیچ‌گاه آن‌ها را کامیت نکنید.
+- پس از موفقیت، خودِ APK با کلید شخصی شما امضا شده است؛ برای اطمینان:
+  `apksigner verify --print-certs app-release.apk` یا `keytool -printcert -jarfile app-release.apk`.
+- اگر APK قبلی روی گوشی با کلید دیگری نصب شده باشد، برای نصب نسخهٔ جدید باید آن را حذف کنید (امضاها یکی نیستند).

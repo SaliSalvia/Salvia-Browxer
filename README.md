@@ -25,7 +25,32 @@ Starts the Vite dev server and browser middleware on port `3000`.
 ```bash
 npm run build
 npm run lint
+npm run test
 ```
+
+The web bundle is the UI layer only. `/api/browse`, `/api/media/probe`, `/api/media/extract` and
+`/api/media/fetch` are served by the Vite middleware in development and by the Android app
+(`NativeProxyClient`) in production. A static `dist/` deployment renders the interface but cannot
+browse or download; use the Android build for real browsing.
+
+### Download engine behaviour
+
+- Direct files resume with an HTTP `Range` request after a pause, and only when the bytes already
+  received are still in memory; otherwise the transfer restarts from zero instead of writing a
+  truncated file.
+- HLS: master playlists are followed to the best variant, `EXT-X-MAP` initialisation segments are
+  prepended, `EXT-X-BYTERANGE` segments are fetched by range, and AES-128 playlists are decrypted with
+  the key the manifest names. `SAMPLE-AES` and live playlists are refused with an explicit reason.
+- DASH: a progressive rendition downloads directly; a manifest that keeps audio in a separate track
+  is refused honestly in the web build instead of saving a silent video (the Android app muxes both
+  tracks). Concatenated MPEG-TS playlists are saved with a `.ts` extension rather than a mislabelled
+  `.mp4`.
+
+### Playback recording
+
+The “Record playback” action captures a real `MediaRecorder` stream from the same-origin proxy. On a
+runtime without `HTMLMediaElement.captureStream` or `MediaRecorder` the app says so instead of
+inventing a file.
 
 ## License
 

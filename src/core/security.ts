@@ -1,4 +1,11 @@
-export const MIN_PASSWORD_CHARS = 4;
+export const MIN_PASSWORD_CHARS = 6;
+
+const LOCKOUT_STORAGE_KEY = 'salvia_locked_folder_lockout_v1';
+
+interface PersistedLockout {
+  failures?: number;
+  lockedUntil?: number;
+}
 
 export class LockoutPolicy {
   private failures = 0;
@@ -11,6 +18,40 @@ export class LockoutPolicy {
     this.maxAttempts = maxAttempts;
     this.baseDelayMillis = baseDelayMillis;
     this.maxDelayMillis = maxDelayMillis;
+    this.restore();
+  }
+
+  /**
+   * The counter used to live only in memory, so reloading the page cleared every
+   * failed attempt and turned the exponential backoff into a no-op.
+   */
+  private restore(): void {
+    try {
+      if (typeof localStorage === 'undefined') return;
+      const raw = localStorage.getItem(LOCKOUT_STORAGE_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as PersistedLockout;
+      if (typeof parsed.failures === 'number' && parsed.failures >= 0) {
+        this.failures = parsed.failures;
+      }
+      if (typeof parsed.lockedUntil === 'number' && parsed.lockedUntil > 0) {
+        this.lockedUntil = parsed.lockedUntil;
+      }
+    } catch {
+      // A corrupt record must never block a legitimate unlock.
+    }
+  }
+
+  private persist(): void {
+    try {
+      if (typeof localStorage === 'undefined') return;
+      localStorage.setItem(
+        LOCKOUT_STORAGE_KEY,
+        JSON.stringify({ failures: this.failures, lockedUntil: this.lockedUntil })
+      );
+    } catch {
+      // Storage can be unavailable in private windows; the in-memory policy still applies.
+    }
   }
 
   isLockedOut(now: number): boolean {
@@ -23,16 +64,21 @@ export class LockoutPolicy {
 
   onFailure(now: number): number {
     this.failures += 1;
-    if (this.failures < this.maxAttempts) return 0;
+    if (this.failures < this.maxAttempts) {
+      this.persist();
+      return 0;
+    }
     const exponent = Math.min(this.failures - this.maxAttempts, 12);
     const delay = Math.min(this.baseDelayMillis * 2 ** exponent, this.maxDelayMillis);
     this.lockedUntil = now + delay;
+    this.persist();
     return delay;
   }
 
   onSuccess(): void {
     this.failures = 0;
     this.lockedUntil = 0;
+    this.persist();
   }
 }
 

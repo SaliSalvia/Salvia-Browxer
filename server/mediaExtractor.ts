@@ -1,3 +1,4 @@
+import { DEFAULT_BLOCKED_HOSTS } from '../src/core/adBlockRules';
 import {
   classifyUrlByPattern,
   isYouTubeUrl,
@@ -31,44 +32,44 @@ export interface ExtractionResponse {
   error?: string;
 }
 
-const BLOCKED_HOSTS = new Set([
-  'doubleclick.net',
-  'googleadservices.com',
-  'googlesyndication.com',
-  'googletagmanager.com',
-  'google-analytics.com',
-  'adservice.google.com',
-  'adnxs.com',
-  'adsrvr.org',
-  'amazon-adsystem.com',
-  'criteo.com',
-  'criteo.net',
-  'openx.net',
-  'pubmatic.com',
-  'rubiconproject.com',
-  'taboola.com',
-  'outbrain.com',
-  'scorecardresearch.com',
-  'quantserve.com',
-  'hotjar.com',
-  'mixpanel.com',
-  'amplitude.com',
-  'segment.io',
-  'sentry.io',
-]);
+// One block list for the whole product: the proxy and the media extractor must not
+// drift away from the rules the browser UI uses.
+const BLOCKED_HOSTS = DEFAULT_BLOCKED_HOSTS;
 
 export function isPrivateOrLocalHostname(hostname: string): boolean {
-  const host = hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.+$/, '');
   if (
     host === 'localhost' ||
-    host === '127.0.0.1' ||
     host === '::1' ||
+    host === '::' ||
     host === '0.0.0.0' ||
-    host.endsWith('.local')
+    host === '::ffff:127.0.0.1' ||
+    host.endsWith('.local') ||
+    host.endsWith('.localhost') ||
+    host.endsWith('.internal')
   ) {
     return true;
   }
-  if (host.startsWith('10.') || host.startsWith('192.168.') || host.startsWith('169.254.')) {
+  if (host.includes(':')) {
+    // IPv6 literals: unique-local (fc00::/7) and link-local (fe80::/10).
+    const firstGroup = parseInt(host.split(':')[0] || '0', 16);
+    if (Number.isFinite(firstGroup)) {
+      if ((firstGroup & 0xfe00) === 0xfc00) return true;
+      if ((firstGroup & 0xffc0) === 0xfe80) return true;
+    }
+    return false;
+  }
+  if (/^\d+$/.test(host)) {
+    // Decimal-encoded IPv4 such as http://2130706433/
+    return true;
+  }
+  if (
+    host.startsWith('127.') ||
+    host.startsWith('10.') ||
+    host.startsWith('192.168.') ||
+    host.startsWith('169.254.') ||
+    host.startsWith('0.')
+  ) {
     return true;
   }
   if (host.startsWith('172.')) {

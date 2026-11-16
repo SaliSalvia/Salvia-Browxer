@@ -155,6 +155,10 @@ export const BrowserScreen: React.FC = () => {
         };
       };
       if (!data || data.source !== 'salvia-browser-bridge' || !data.payload) return;
+      // Only the page we rendered may drive this window: an unrelated window that
+      // knows the message shape must not be able to inject candidates or navigate.
+      const frameWindow = iframeRef.current?.contentWindow;
+      if (!frameWindow || ev.source !== frameWindow) return;
 
       if (data.type === 'media-dom' && Array.isArray(data.payload.items)) {
         reportDetectedMediaFromBridge(
@@ -169,7 +173,7 @@ export const BrowserScreen: React.FC = () => {
           data.payload.mediaUrl
         );
       } else if (data.type === 'navigate' && data.payload.url) {
-        navigateCurrentTab(data.payload.url);
+        if (/^https?:\/\//i.test(data.payload.url)) navigateCurrentTab(data.payload.url);
       } else if (data.type === 'find-result') {
         setFindResult(data.payload.matches ?? 0, data.payload.active ?? 0);
       }

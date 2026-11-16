@@ -270,6 +270,8 @@ const en = {
   action_stop_recording: 'Stop and save',
   recording_in_progress: 'Recording',
   recording_saved: 'Recording saved',
+  recording_unavailable:
+    'This stream cannot be recorded in this build. Open it in the Android app, or download the file directly.',
 
   // About & Diagnostics
   about_title: 'About SalviaBrowxer',
@@ -560,6 +562,8 @@ const fa: TranslationMap = {
   action_stop_recording: 'توقف و ذخیرهٔ ضبط',
   recording_in_progress: 'در حال ضبط',
   recording_saved: 'ضبط ذخیره شد',
+  recording_unavailable:
+    'این استریم در این نسخه قابل ضبط نیست. آن را در نسخهٔ اندروید باز کنید یا فایل را مستقیم دانلود کنید.',
 
   about_title: 'دربارهٔ SalviaBrowxer',
   about_version: 'نگارش {version}',
