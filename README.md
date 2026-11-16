@@ -14,7 +14,7 @@ A modern web application rewrite of **SalviaBrowxer** (`SaliSalvia/SalviaBrowxer
 ## Development
 
 ```bash
-npm install
+npm ci
 npm run dev
 ```
 
